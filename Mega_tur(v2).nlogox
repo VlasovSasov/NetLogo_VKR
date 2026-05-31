@@ -1,0 +1,4158 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.3" snapToGrid="true">
+  <code><![CDATA[;; ============================================================
+;; Глобальные параметры и виджеты
+;; ============================================================
+globals [
+  min-gap               ; минимальный зазор между дронами при размещении
+  iter-counter          ; общий счётчик итераций для алгоритмов
+  packet                ; агент-визуализатор пакета (если есть)
+  update-tick           ; счётчик тиков для периодического обновления алгоритмов
+  visited-for-packet    ; список who узлов, через которые прошёл пакет
+  packet-hop-count      ; число переходов пакета (для предотвращения зацикливания)
+  current-source        ; текущий дрон-источник (S или D)
+  current-dest          ; текущий дрон-приёмник (D или S)
+  visit-penalty-factor  ; коэффициент штрафа за повторное посещение узла
+  visit-counts-list     ; список пар [who, количество посещений]
+  silent-mode?          ; подавлять ли детальный вывод (true – только сводка)
+  epsilon               ; параметр ε-жадной стратегии (вероятность случайного выбора)
+
+  ;; Индексы полей в algo-data (единая структура)
+  idx-pop               ; 0 – список популяции
+  idx-leader1-pos       ; 1 – α (GWO), best-pos (FSS), local-leader-pos (SMO)
+  idx-leader1-fit        ; 2 – фитнес первого лидера
+  idx-leader2-pos       ; 3 – β (GWO), не используется в FSS, global-leader-pos (SMO)
+  idx-leader2-fit        ; 4 – фитнес второго лидера
+  idx-leader3-pos       ; 5 – δ (GWO)
+  idx-leader3-fit        ; 6 – фитнес третьего лидера
+  idx-local-limit-count ; 7 – счётчик локального лимита (SMO)
+  idx-global-limit-count; 8 – счётчик глобального лимита (SMO)
+  idx-counter           ; 9 – счётчик итераций GWO
+
+  ;; Константа невалидного фитнеса
+  INVALID-FIT           ; очень маленькое число для отметки недопустимых решений
+
+  test-mode?            ; флаг режима тестирования (отключает движение)
+  test-random-seed      ; зерно генератора для воспроизводимости тестов
+
+  ;; Глобальные переменные для экспертной системы
+  fact-base             ; список фактов (утверждений) для прямого вывода
+  knowledge-base        ; список правил в формате [условие действие]
+  inference-log         ; лог последнего вывода для отображения
+  current-algo          ; текущий алгоритм маршрутизации
+
+  last-inference-summary ; краткая сводка последнего решения ЭС
+  route-summary         ; сводка, сохранённая из run-one-way
+  prev-fitness          ; для отображения динамики обучения (дельта фитнеса)
+  
+  test-snapshot   ;; список состояний всех черепах для восстановления мира
+]
+
+;; ============================================================
+;; Атрибуты дронов
+;; ============================================================
+turtles-own [
+  energy        ; запас энергии (условные единицы)
+  comm-range    ; радиус связи (км)
+  speed         ; скорость движения (км/ч)
+  has-packet?   ; флаг: находится ли пакет у данного дрона
+  algo-data     ; список из двух элементов [forward-data, backward-data]
+                ; каждый элемент – список полей популяции и лидеров
+  failure-ticks ; сколько тиков осталось быть выключенным (0 = включён)
+  dsr-cache    ;; список кэшированных маршрутов: [ [dest-who route-list] ... ]
+]
+
+;; ============================================================
+;; Инициализация индексов и глобальных параметров
+;; ============================================================
+to setup-indices
+  ;; Задаём числовые индексы для единообразного доступа к полям algo-data
+  set idx-pop              0
+  set idx-leader1-pos      1
+  set idx-leader1-fit      2
+  set idx-leader2-pos      3
+  set idx-leader2-fit      4
+  set idx-leader3-pos      5
+  set idx-leader3-fit      6
+  set idx-local-limit-count 7
+  set idx-global-limit-count 8
+  set idx-counter          9
+end
+
+to setup-globals
+  ;; Сброс всех глобальных переменных к начальным значениям
+  set min-gap 0.05
+  set iter-counter 0
+  if is-turtle? packet [ ask packet [ die ] ]
+  set packet nobody
+  set update-tick 0
+  set visit-penalty-factor 2.0
+  set visit-counts-list []
+  set test-mode? false
+  set silent-mode? false
+  set epsilon 0.2
+  set INVALID-FIT -1e9
+  set fact-base []
+  set knowledge-base []
+  set inference-log []
+  set current-algo ""
+  set last-inference-summary ""
+  set route-summary ""
+  set prev-fitness INVALID-FIT
+
+  setup-indices
+end
+
+;; ============================================================
+;; Вспомогательные функции для algo-data
+;; ============================================================
+
+;; Получить значение поля field из направления dir дрона t
+to-report algo-get [t dir field]
+  let data item dir ([algo-data] of t)
+  report item field data
+end
+
+;; Установить значение поля field направления dir дрона t
+to algo-set [t dir field value]
+  let data item dir ([algo-data] of t)
+  let new-data replace-item field data value
+  let all-data [algo-data] of t
+  set all-data replace-item dir all-data new-data
+  ask t [ set algo-data all-data ]
+end
+
+;; ============================================================
+;; Поиск свободного места для размещения дрона
+;; ============================================================
+
+to-report find-position [radius]
+  ;; Возвращает координаты [x y], свободные от пересечений с другими дронами
+  let margin radius
+  let x-range (max-pxcor - min-pxcor)
+  let y-range (max-pycor - min-pycor)
+  let attempts 0
+  while [attempts < 1000] [
+    let new-x (random-float (x-range - 2 * margin) + min-pxcor + margin)
+    let new-y (random-float (y-range - 2 * margin) + min-pycor + margin)
+    if not any? turtles with [
+      distancexy new-x new-y < (size / 2 + radius + min-gap)
+    ] [
+      report (list new-x new-y)
+    ]
+    set attempts attempts + 1
+  ]
+  error "Не удалось разместить дрона. Увеличьте размер мира или уменьшите количество."
+end
+
+;; ============================================================
+;; Создание карты со случайным размещением
+;; ============================================================
+to create-map
+  ;; Полная перестройка мира: очистка, создание S, D и случайного числа обычных дронов
+  clear-all
+  ask patches [ set pcolor white ]
+  setup-globals
+
+  let ordinary-size 0.25
+  let special-size 0.25
+
+  ;; Создаём дрон-источник (S)
+  let pos find-position (special-size / 2)
+  create-turtles 1 [
+    set shape "circle"
+    set color green
+    set size special-size
+    set label "S"
+    set label-color black
+    set energy start-energy
+    set comm-range comm-range-value
+    set speed drone-speed
+    set failure-ticks 0
+    setxy item 0 pos item 1 pos
+    set dsr-cache []
+  ]
+
+  ;; Создаём дрон-приёмник (D)
+  set pos find-position (special-size / 2)
+  create-turtles 1 [
+    set shape "circle"
+    set color red
+    set size special-size
+    set label "D"
+    set label-color black
+    set energy dest-energy
+    set comm-range comm-range-value
+    set speed drone-speed
+    set failure-ticks 0
+    setxy item 0 pos item 1 pos
+    set dsr-cache []
+  ]
+
+  ;; Генерируем случайное количество обычных дронов (от 2 до 20)
+  let num-ordinary (2 + random 19)
+  let i 1
+  repeat num-ordinary [
+    set pos find-position (ordinary-size / 2)
+    let actual-energy ordinary-energy
+    if random-energy? [
+      set actual-energy round (ordinary-energy * (0.9 + random-float 0.2))
+      if actual-energy < 1 [ set actual-energy 1 ]
+    ]
+    let actual-speed drone-speed
+    if random-speed? [
+      set actual-speed drone-speed * (0.9 + random-float 0.2)
+    ]
+    let actual-range comm-range-value
+    if random-range? [
+      set actual-range comm-range-value * (0.9 + random-float 0.2)
+    ]
+    create-turtles 1 [
+      set shape "circle"
+      set color blue
+      set size ordinary-size
+      set label i
+      set label-color black
+      set energy actual-energy
+      set comm-range actual-range
+      set speed actual-speed
+      set failure-ticks 0
+      setxy item 0 pos item 1 pos
+      set dsr-cache []
+    ]
+    set i i + 1
+  ]
+
+  reset-ticks
+  update-connections
+  ;; Инициализируем популяции для всех алгоритмов
+  reinit-all-agents "GWO"
+  reinit-all-agents "FSS"
+  reinit-all-agents "SMO"
+  reinit-all-agents "DSR"
+  update-drone-info true
+end
+
+;; ============================================================
+;; Установка специального дрона (S или D) вручную
+;; ============================================================
+to set-special-drone [drone-color label-str energy-val]
+  ;; Заменяет специального дрона (если существует) на новый с заданными координатами
+  setup-globals
+  let special-size 0.25
+  let radius special-size / 2
+
+  let input user-input (word "Введите координаты " label-str "-дрона (X Y или X,Y):")
+  let wrapped (word "[" input "]")
+  let coords []
+  carefully [
+    set coords read-from-string wrapped
+  ] [
+    user-message "Ошибка: введите два числа, разделённых пробелом или запятой."
+    stop
+  ]
+  if length coords != 2 [
+    user-message "Ошибка: необходимо ввести ровно два числа."
+    stop
+  ]
+  let new-x item 0 coords
+  let new-y item 1 coords
+
+  if not is-number? new-x or not is-number? new-y [
+    user-message "Ошибка: координаты должны быть числами."
+    stop
+  ]
+
+  let margin radius
+  if new-x < min-pxcor + margin or new-x > max-pxcor - margin or
+     new-y < min-pycor + margin or new-y > max-pycor - margin [
+    user-message (word "Координаты должны быть в пределах ["
+      (min-pxcor + margin) ", " (max-pxcor - margin) "] по X и ["
+      (min-pycor + margin) ", " (max-pycor - margin) "] по Y (с учётом размера дрона).")
+    stop
+  ]
+
+  let old-drone one-of turtles with [color = drone-color and label = label-str]
+  if old-drone != nobody [ ask old-drone [ die ] ]
+
+  if any? other turtles with [
+    distancexy new-x new-y < (size / 2 + radius + min-gap)
+  ] [
+    user-message "Это место занято другим дроном. Выберите другие координаты."
+    stop
+  ]
+
+  create-turtles 1 [
+    set shape "circle"
+    set color drone-color
+    set size special-size
+    set label label-str
+    set label-color black
+    set energy energy-val
+    set failure-ticks 0
+    set comm-range comm-range-value
+    set speed drone-speed
+    setxy new-x new-y
+    set dsr-cache []
+  ]
+
+  reset-ticks
+  update-connections
+  reinit-all-agents "GWO"
+  reinit-all-agents "FSS"
+  reinit-all-agents "SMO"
+  reinit-all-agents "DSR"
+  update-drone-info true
+end
+
+;; Установить S дрон вручную
+to set-start-drone
+  set-special-drone green "S" start-energy
+end
+
+;; Установить D дрон вручную
+to set-dest-drone
+  set-special-drone red "D" dest-energy
+end
+
+;; ============================================================
+;; Создание заданного количества обычных дронов
+;; ============================================================
+to create-ordinary-drones
+  ;; Удаляет всех синих дронов и создаёт точное число новых
+  setup-globals
+  let ordinary-size 0.25
+  let radius ordinary-size / 2
+
+  let num-str user-input "Введите количество обычных дронов:"
+  let num 0
+  carefully [
+    set num read-from-string num-str
+  ] [
+    user-message "Ошибка: введите целое число."
+    stop
+  ]
+  if not is-number? num or num < 0 [
+    user-message "Ошибка: количество должно быть неотрицательным числом."
+    stop
+  ]
+  if num > 100 [
+    user-message "Слишком много дронов. Мир может не вместить их."
+  ]
+
+  ask turtles with [color = blue] [ die ]
+
+  let i 1
+  repeat num [
+    let pos find-position radius
+
+    let actual-energy ordinary-energy
+    if random-energy? [
+      set actual-energy round (ordinary-energy * (0.9 + random-float 0.2))
+      if actual-energy < 1 [ set actual-energy 1 ]
+    ]
+
+    let actual-speed drone-speed
+    if random-speed? [
+      set actual-speed drone-speed * (0.9 + random-float 0.2)
+    ]
+
+    let actual-range comm-range-value
+    if random-range? [
+      set actual-range comm-range-value * (0.9 + random-float 0.2)
+    ]
+
+    create-turtles 1 [
+      set shape "circle"
+      set color blue
+      set size ordinary-size
+      set label i
+      set label-color black
+      set energy actual-energy
+      set comm-range actual-range
+      set failure-ticks 0
+      set speed actual-speed
+      setxy item 0 pos item 1 pos
+      set dsr-cache []
+    ]
+    set i i + 1
+  ]
+
+  reset-ticks
+  update-connections
+  reinit-all-agents "GWO"
+  reinit-all-agents "FSS"
+  reinit-all-agents "SMO"
+  reinit-all-agents "DSR"
+  update-drone-info true
+end
+
+;; ============================================================
+;; Обмен дронов местами
+;; ============================================================
+to swap-drones
+  ;; Меняет координаты двух указанных дронов (S, D или обычных)
+  let input-str user-input "Введите метки двух дронов для обмена (например: S D или 1 3 или D 5):"
+  output-print (word "Введено: " input-str)
+
+  let parts parse-two-labels input-str
+  output-print (word "Разобранные метки: " parts)
+
+  if length parts != 2 [
+    user-message "Ошибка: необходимо ввести ровно две метки."
+    stop
+  ]
+  let label1 item 0 parts
+  let label2 item 1 parts
+
+  let drone1 find-drone-by-label label1
+  let drone2 find-drone-by-label label2
+
+  output-print (word "Дрон для метки '" label1 "' найден? " (drone1 != nobody))
+  if drone1 != nobody [ output-print (word "  его who = " [who] of drone1 ", label = " [label] of drone1 ", цвет = " [color] of drone1) ]
+
+  output-print (word "Дрон для метки '" label2 "' найден? " (drone2 != nobody))
+  if drone2 != nobody [ output-print (word "  его who = " [who] of drone2 ", label = " [label] of drone2 ", цвет = " [color] of drone2) ]
+
+  if drone1 = nobody [
+    user-message (word "Дрон с меткой '" label1 "' не найден.")
+    stop
+  ]
+  if drone2 = nobody [
+    user-message (word "Дрон с меткой '" label2 "' не найден.")
+    stop
+  ]
+  if drone1 = drone2 [
+    user-message "Нельзя обменять дрона с самим собой."
+    stop
+  ]
+
+  output-print "=== ДО ОБМЕНА ==="
+  output-print (word "Позиция1: " [xcor] of drone1 ", " [ycor] of drone1)
+  output-print (word "Позиция2: " [xcor] of drone2 ", " [ycor] of drone2)
+
+  let x1 [xcor] of drone1
+  let y1 [ycor] of drone1
+  let x2 [xcor] of drone2
+  let y2 [ycor] of drone2
+
+  ask drone1 [ setxy x2 y2 ]
+  ask drone2 [ setxy x1 y1 ]
+
+  output-print "=== ПОСЛЕ ОБМЕНА ==="
+  output-print (word "Позиция1: " [xcor] of drone1 ", " [ycor] of drone1)
+  output-print (word "Позиция2: " [xcor] of drone2 ", " [ycor] of drone2)
+
+  display
+  update-connections
+  update-drone-info true
+
+  output-print "Обмен координат выполнен."
+end
+
+;; Найти дрона по текстовой метке (S, D или число)
+to-report find-drone-by-label [lbl]
+  if lbl = "S" [
+    report one-of turtles with [color = green and label = "S"]
+  ]
+  if lbl = "D" [
+    report one-of turtles with [color = red and label = "D"]
+  ]
+
+  let candidate one-of turtles with [color = blue and label = lbl]
+  if candidate != nobody [ report candidate ]
+
+  let num-lbl 0
+  let is-num false
+  carefully [
+    set num-lbl read-from-string lbl
+    set is-num true
+  ] [ ]
+  if is-num [
+    let candidate2 one-of turtles with [color = blue and label = num-lbl]
+    if candidate2 != nobody [ report candidate2 ]
+  ]
+
+  if is-number? lbl [
+    let candidate3 one-of turtles with [color = blue and label = lbl]
+    if candidate3 != nobody [ report candidate3 ]
+  ]
+
+  report nobody
+end
+
+;; Разобрать строку с двумя метками, разделёнными пробелом или запятой
+to-report parse-two-labels [s]
+  let str replace-chars s "," " "
+  let result []
+  let current ""
+  let i 0
+  while [i < length str] [
+    let ch substring str i (i + 1)
+    ifelse ch = " " [
+      if current != "" [
+        set result lput current result
+        set current ""
+      ]
+    ] [
+      set current (word current ch)
+    ]
+    set i i + 1
+  ]
+  if current != "" [
+    set result lput current result
+  ]
+  report result
+end
+
+;; Заменить все символы old-char на new-char в строке str
+to-report replace-chars [str old-char new-char]
+  let result ""
+  let i 0
+  while [i < length str] [
+    let ch substring str i (i + 1)
+    ifelse ch = old-char [
+      set result (word result new-char)
+    ] [
+      set result (word result ch)
+    ]
+    set i i + 1
+  ]
+  report result
+end
+
+;; ============================================================
+;; Обновление связей
+;; ============================================================
+to update-connections
+  ;; Перестраивает все связи между дронами на основе текущего положения и радиуса
+  ask links [ die ]
+  let active ifelse-value dead-drone-off?
+               [ turtles with [energy > 0 and failure-ticks = 0] ]
+               [ turtles with [failure-ticks = 0] ]
+  ask active [
+    let me self
+    create-links-with other active with [
+      who > [who] of me and
+      distance me <= comm-range and
+      distance me <= [comm-range] of me
+    ] [ set color gray ]
+  ]
+end
+
+;; ============================================================
+;; Управление динамическими отказами дронов
+;; ============================================================
+to apply-random-failures
+  ;; Если переключатель включён, часть дронов временно выходит из строя
+  if not dynamic-failures? [ stop ]
+
+  ;; Уменьшаем счётчики отказа и восстанавливаем цвет при завершении
+  ask turtles [
+    if failure-ticks > 0 [
+      set failure-ticks failure-ticks - 1
+      if failure-ticks = 0 and energy > 0 [
+        set-color-by-role
+      ]
+    ]
+  ]
+
+  ;; Отбираем кандидатов: живые синие дроны (не S/D) не в отказе
+  let candidates turtles with [
+    color = blue and
+    label != "S" and label != "D" and
+    energy > 0 and
+    failure-ticks = 0
+  ]
+
+  if any? candidates [
+    let total-candidates count candidates
+    ;; Максимальное число отключаемых дронов: 30% от кандидатов, но не менее 1
+    let max-to-fail max (list 1 (round (total-candidates * 0.3)))
+    let num-to-fail 1 + random max-to-fail   ;; случайное число от 1 до max-to-fail
+    let to-fail n-of num-to-fail candidates
+
+    ask to-fail [
+      set failure-ticks 1 + random 4    ;; отказ на 1–4 тиков
+      set color black
+    ]
+  ]
+end
+
+;; Восстанавливает исходный цвет дрона по его роли
+to set-color-by-role
+  if label = "S" [ set color green stop ]
+  if label = "D" [ set color red stop ]
+  set color blue
+end
+
+;; Принудительно включает все дроны (используется в конце цикла)
+to restore-all-drones
+  ask turtles [
+    if failure-ticks > 0 [
+      set failure-ticks 0
+      if energy > 0 [ set-color-by-role ]
+    ]
+  ]
+end
+
+;; ============================================================
+;; Вывод информации о дронах
+;; ============================================================
+to update-drone-info [clear?]
+  ;; Печатает сводку о всех дронах: координаты, энергию, соседей
+  if clear? [ clear-output ]
+
+  let start-drone one-of turtles with [color = green and label = "S"]
+  ifelse start-drone != nobody [
+    let status ifelse-value ([energy] of start-drone > 0) ["ВКЛ"] ["ВЫКЛ"]
+    output-print (word "Начальный дрон (S): Статус = " status)
+    output-print (word "  Координаты: X = " precision ([xcor] of start-drone) 2
+                       ", Y = " precision ([ycor] of start-drone) 2)
+    output-print (word "  Параметры: Энергия = " precision ([energy] of start-drone) 0 " сек"
+                       ", Радиус связи = " precision ([comm-range] of start-drone) 2 " км"
+                       ", Скорость = " precision ([speed] of start-drone) 2 " км/ч")
+    output-print (word "  Видит следующих дронов: " get-neighbors-list start-drone)
+    output-print ""
+  ] [
+    output-print "Начальный дрон (S): не установлен"
+    output-print ""
+  ]
+
+  let dest-drone one-of turtles with [color = red and label = "D"]
+  ifelse dest-drone != nobody [
+    let status ifelse-value ([energy] of dest-drone > 0) ["ВКЛ"] ["ВЫКЛ"]
+    output-print (word "Конечный дрон (D): Статус = " status)
+    output-print (word "  Координаты: X = " precision ([xcor] of dest-drone) 2
+                       ", Y = " precision ([ycor] of dest-drone) 2)
+    output-print (word "  Параметры: Энергия = " precision ([energy] of dest-drone) 0 " сек"
+                       ", Радиус связи = " precision ([comm-range] of dest-drone) 2 " км"
+                       ", Скорость = " precision ([speed] of dest-drone) 2 " км/ч")
+    output-print (word "  Видит следующих дронов: " get-neighbors-list dest-drone)
+    output-print ""
+  ] [
+    output-print "Конечный дрон (D): не установлен"
+    output-print ""
+  ]
+
+  let ordinary-drones turtles with [color = blue]
+  ifelse any? ordinary-drones [
+    output-print "Обычные дроны:"
+    let sorted-drones sort-on [label] ordinary-drones
+    foreach sorted-drones [ d ->
+      let status ifelse-value ([energy] of d > 0) ["ВКЛ"] ["ВЫКЛ"]
+      output-print (word "  Дрон " [label] of d ": Статус = " status)
+      output-print (word "    Координаты: X = " precision ([xcor] of d) 2
+                         ", Y = " precision ([ycor] of d) 2)
+      output-print (word "    Параметры: Энергия = " precision ([energy] of d) 0 " сек"
+                         ", Радиус связи = " precision ([comm-range] of d) 2 " км"
+                         ", Скорость = " precision ([speed] of d) 2 " км/ч")
+      output-print (word "    Видит следующих дронов: " get-neighbors-list d)
+      output-print ""
+    ]
+  ] [
+    output-print "Обычные дроны: отсутствуют"
+  ]
+end
+
+;; Возвращает строку с метками соседей дрона
+to-report get-neighbors-list [drone]
+  let neighbor-nums sort [who] of ([link-neighbors] of drone)
+  let result ""
+  foreach neighbor-nums [ n ->
+    let neighbor-turtle turtle n
+    let label-str [label] of neighbor-turtle
+    ifelse empty? result [
+      set result (word result label-str)
+    ] [
+      set result (word result ", " label-str)
+    ]
+  ]
+  if empty? result [ set result "нет" ]
+  report result
+end
+
+;; ============================================================
+;; Движение дронов
+;; ============================================================
+to move-drones [output-info?]
+  ;; Каждый дрон с энергией > 0 делает случайный шаг, если не тестовый режим
+  if test-mode? = true [ stop ]
+
+  if not is-number? min-gap [ setup-globals ]
+
+  ask turtles with [energy > 0] [
+    let rad size / 2
+    let max-step speed / 3600.0
+    let angle random-float 360
+    let step random-float max-step
+    let new-x xcor + step * sin angle
+    let new-y ycor + step * cos angle
+
+    if new-x >= min-pxcor + rad and new-x <= max-pxcor - rad and
+       new-y >= min-pycor + rad and new-y <= max-pycor - rad [
+
+      if not any? other turtles with [
+        distancexy new-x new-y < (size / 2 + rad + min-gap)
+      ] [
+        setxy new-x new-y
+        set energy energy - 1
+        if energy < 0 [ set energy 0 ]
+      ]
+    ]
+  ]
+
+  update-connections
+  if output-info? [ update-drone-info true ]
+end
+
+;; ============================================================
+;; Утилиты для счётчика посещений
+;; ============================================================
+
+;; Получить количество посещений узла w (по who)
+to-report get-visit-count [w]
+  let pair filter [ entry -> item 0 entry = w ] visit-counts-list
+  ifelse empty? pair [
+    report 0
+  ] [
+    report item 1 (first pair)
+  ]
+end
+
+;; Увеличить счётчик посещений узла w
+to increment-visit-count [w]
+  let old-count get-visit-count w
+  let new-count old-count + 1
+  set visit-counts-list filter [ entry -> item 0 entry != w ] visit-counts-list
+  set visit-counts-list lput (list w new-count) visit-counts-list
+end
+
+;; Сбросить все счётчики посещений
+to reset-visit-counts
+  set visit-counts-list []
+end
+
+;; ============================================================
+;; Построение жадного маршрута от source до dest (для фитнеса)
+;; ============================================================
+to-report build-greedy-path [source dest pos-vector]
+  ;; Строит маршрут с обязательным географическим прогрессом БЕЗ повторной финальной проверки
+  let all-ordinary sort turtles with [color = blue]
+  if empty? all-ordinary [
+    if [link-with dest] of source != nobody [
+      report (list [who] of source [who] of dest)
+    ]
+    report []
+  ]
+
+  let sorted-indices sort-by [
+    [x y] -> (item x pos-vector) > (item y pos-vector)
+  ] (range length all-ordinary)
+
+  let path (list [who] of source)
+  let current source
+  let dist-current distance dest
+  foreach sorted-indices [ idx ->
+    let node item idx all-ordinary
+    if not member? [who] of node path and [link-with node] of current != nobody [
+      let dist-node distance dest
+      if dist-node < dist-current [
+        set path lput [who] of node path
+        set current node
+        set dist-current dist-node
+        if [link-with dest] of current != nobody [
+          set path lput [who] of dest path
+          report path
+        ]
+      ]
+    ]
+  ]
+  ;; Если цель не достигнута, но есть прямая связь – добавляем её
+  if [link-with dest] of current != nobody [
+    set path lput [who] of dest path
+  ]
+  ;; Возвращаем путь только если он завершается получателем
+  if last path = [who] of dest [ report path ]
+  report []
+end
+
+;; ============================================================
+;; Фитнес-функция
+;; ============================================================
+to-report fitness-of-path [path source dest]
+  ;; Вычисляет качество маршрута: -hops * hop-penalty + total-energy узлов пути
+  if empty? path [ report INVALID-FIT ]
+  let total-energy 0
+  let total-hops (length path - 1)
+  let prev-node source
+  let valid? true
+  foreach but-first path [ node-id ->
+    let next-node turtle node-id
+    if [link-with next-node] of prev-node = nobody [
+      set valid? false
+    ]
+    set total-energy total-energy + [energy] of next-node
+    set prev-node next-node
+  ]
+  if not valid? [ report INVALID-FIT ]
+  if total-hops = 0 [ report INVALID-FIT ]
+  let fitness (- total-hops * hop-penalty) + (total-energy * energy-weight)
+  report fitness
+end
+
+;; Удалить визуальный пакет и сбросить флаги
+to cleanup-packet
+  if packet != nobody [
+    ask packet [ die ]
+    set packet nobody
+  ]
+  ask turtles [ set has-packet? false ]
+end
+
+;; ============================================================
+;; Универсальная инициализация агентов для алгоритма
+;; ============================================================
+to reinit-all-agents [algo]
+  ;; Для каждого дрона создаёт случайную популяцию и назначает лидеров
+  let all-ordinary sort turtles with [color = blue]
+  let n-blue length all-ordinary
+  let dim n-blue + 2
+  let source one-of turtles with [color = green and label = "S"]
+  let dest   one-of turtles with [color = red and label = "D"]
+
+  if source = nobody or dest = nobody [ stop ]
+
+  if algo = "DSR" [
+    ;; Сброс кэшей всех дронов
+    ask turtles [ set dsr-cache [] ]
+    stop
+  ]
+  
+  if n-blue = 0 [ stop ]
+
+  let pop-size get-algo-pop-size algo
+  let leader-count get-algo-leader-count algo
+
+  ask turtles [
+    set algo-data n-values 2 [ [] ]
+    foreach [0 1] [ dir ->
+      let target ifelse-value (dir = 0) [dest] [source]
+      let pop []
+      repeat pop-size [
+        let pos n-values dim [ random-float 1.0 ]
+        let p build-greedy-path self target pos
+        let fit ifelse-value (empty? p) [ INVALID-FIT ] [ fitness-of-path p self target ]
+        let attempts 0
+        while [fit = INVALID-FIT and attempts < 10] [
+          set pos n-values dim [ random-float 1.0 ]
+          set p build-greedy-path self target pos
+          set fit ifelse-value (empty? p) [ INVALID-FIT ] [ fitness-of-path p self target ]
+          set attempts attempts + 1
+        ]
+        ifelse algo = "FSS"
+          [ set pop lput (list pos fit 1.0) pop ]
+          [ set pop lput (list pos fit) pop ]
+      ]
+      set pop sort-by [ [x y] -> (item 1 y) > (item 1 x) ] pop
+
+      let data []
+      set data lput pop data
+      let i 0
+      while [i < leader-count] [
+        let leader item i pop
+        set data lput (item 0 leader) data   ; позиция лидера
+        set data lput (item 1 leader) data   ; фитнес лидера
+        set i i + 1
+      ]
+      if algo = "SMO" [
+        set data lput 0 data   ; local-limit-count
+        set data lput 0 data   ; global-limit-count
+      ]
+      if algo = "GWO" [
+        set data lput 0 data   ; counter
+      ]
+      while [length data < 10] [ set data lput 0 data ]
+      set algo-data replace-item dir algo-data data
+    ]
+    set has-packet? false
+  ]
+end
+
+;; Возвращает размер популяции для алгоритма
+to-report get-algo-pop-size [algo]
+  if algo = "GWO" [ report gwo-pop-size ]
+  if algo = "FSS" [ report fss-pop-size ]
+  if algo = "SMO" [ report smo-pop-size ]
+  if algo = "DSR" [ report 0 ]
+  report 20
+end
+
+;; Возвращает количество лидеров для алгоритма
+to-report get-algo-leader-count [algo]
+  if algo = "GWO" [ report 3 ]
+  if algo = "FSS" [ report 1 ]
+  if algo = "SMO" [ report 2 ]
+  report 0
+end
+
+;; ============================================================
+;; DSR – распределённый поиск маршрута через соседей (RREQ)
+;; ============================================================
+to-report dsr-lookup-cache [d dest]
+  if dest = nobody [ report [] ]
+  let target [who] of dest
+  let cache [dsr-cache] of d
+  let len length cache
+  let i 0
+  while [i < len] [
+    let entry item i cache
+    if item 0 entry = target [
+      report item 1 entry
+    ]
+    set i i + 1
+  ]
+  report []
+end
+
+to dsr-add-cache [d dest route]
+  let target [who] of dest
+  let old-cache [dsr-cache] of d
+  let new-cache []
+  let len length old-cache
+  let i 0
+  while [i < len] [
+    let entry item i old-cache
+    if item 0 entry != target [
+      set new-cache lput entry new-cache
+    ]
+    set i i + 1
+  ]
+  set new-cache lput (list target route) new-cache
+  ask d [
+    set dsr-cache new-cache
+    while [length dsr-cache > 10] [
+      set dsr-cache butfirst dsr-cache
+    ]
+  ]
+end
+
+to-report dsr-discover-route [source dest max-depth]
+  ;; Итеративный BFS-поиск кратчайшего пути с ограничением по глубине.
+  if source = dest [ report (list [who] of source) ]
+
+  let parent-list []
+  let visited (list [who] of source)
+  let queue (list source)
+  let depths (list 0)   ;; глубина каждого узла в очереди
+  let found? false
+
+  while [not empty? queue and not found?] [
+    let current first queue
+    let d first depths
+    set queue butfirst queue
+    set depths butfirst depths
+
+    ;; Если текущая глубина уже равна max-depth, дальше не идём
+    if d < max-depth [
+      let raw-nbrs [link-neighbors] of current
+      let nbrs raw-nbrs with [energy > 0 and failure-ticks = 0]
+      foreach sort nbrs [ n ->
+        if not member? ([who] of n) visited [
+          if d + 1 <= max-depth [
+            set visited lput ([who] of n) visited
+            set parent-list lput (list ([who] of n) ([who] of current)) parent-list
+            if n = dest [ set found? true ]
+            set queue lput n queue
+            set depths lput (d + 1) depths
+          ]
+        ]
+      ]
+    ]
+  ]
+
+  if not found? [ report [] ]
+
+  ;; Восстановление маршрута
+  let path (list [who] of dest)
+  let cur [who] of dest
+  while [cur != [who] of source] [
+    let p -1
+    let i 0
+    while [i < length parent-list] [
+      let entry item i parent-list
+      if item 0 entry = cur [
+        set p item 1 entry
+        set i length parent-list
+      ]
+      set i i + 1
+    ]
+    if p = -1 [ report [] ]
+    set path fput p path
+    set cur p
+  ]
+  report path
+end
+
+;; Проверяет, существует ли хотя бы один путь между source и dest
+to-report is-path-possible? [source dest max-depth]
+  if source = dest [ report true ]
+  let visited (list [who] of source)
+  let queue (list source)
+  let depths (list 0)
+  while [not empty? queue] [
+    let current first queue
+    let d first depths
+    set queue butfirst queue
+    set depths butfirst depths
+    if d < max-depth [
+      let raw-nbrs [link-neighbors] of current
+      let nbrs raw-nbrs with [energy > 0 and failure-ticks = 0]
+      foreach sort nbrs [ n ->
+        if not member? ([who] of n) visited [
+          if n = dest [ report true ]
+          set visited lput ([who] of n) visited
+          set queue lput n queue
+          set depths lput (d + 1) depths
+        ]
+      ]
+    ]
+  ]
+  report false
+end
+
+;; Глобальная переменная для пометки посещённых узлов во время одного поиска DSR
+;; (добавьте в globals: dsr-visited-for-discovery)
+
+;; ============================================================
+;; Универсальная маршрутизация пакета (forward-packet)
+;; ============================================================
+to algo-forward-packet [algo]
+  ;; Выполняет один шаг передачи пакета от текущего дрона.
+  set current-algo algo
+  if silent-mode? = false [
+    output-print (word "=== Дрон " label " (" who ") принимает решение (алгоритм " algo ") ===")
+  ]
+  if not has-packet? [ stop ]
+  let dest current-dest
+  if dest = nobody [ stop ]
+
+  increment-visit-count who
+  if not member? who visited-for-packet [
+    set visited-for-packet lput who visited-for-packet
+  ]
+
+  ;; 1. Сбор фактов
+  let facts collect-facts self dest
+  if silent-mode? = false [
+    output-print "База фактов:"
+    foreach facts [ f -> output-print (word "  - " f) ]
+  ]
+
+  ;; 2. Обратный вывод (только если не подавлен вывод)
+  let reachable? false
+  if silent-mode? = false [
+    set reachable? backward-chain self dest []
+    ifelse reachable? [
+      output-print "  [Обратный вывод] Цель ДОСТИЖИМА."
+    ] [
+      output-print "  [Обратный вывод] Цель НЕ достижима из текущей позиции."
+    ]
+  ]
+
+  ;; 3. Прямой вывод
+  let action forward-chain facts
+  if silent-mode? = false [
+    output-print "Ход прямого вывода:"
+    foreach inference-log [ line -> output-print line ]
+    output-print (word "Выбранное действие: " action)
+  ]
+
+  ;; 4. Прямая передача
+  if action = "передать напрямую" [
+    if link-with dest != nobody [
+      if silent-mode? = false [ output-print (word "  [Действие] Передаю пакет напрямую дрону " [label] of dest) ]
+      move-packet-to dest
+      set has-packet? false
+      ask dest [ set has-packet? true ]
+      if silent-mode? = false [ output-print "[Отладка] Конец algo-forward-packet (прямая передача)" ]
+      record-inference-summary action reachable?
+      stop
+    ]
+  ]
+
+  if action = "пакет потерян" [
+    if silent-mode? = false [ output-print "  [Действие] Пакет потерян (нет доступных соседей)." ]
+    if packet != nobody [ ask packet [ die ] ]
+    set packet nobody
+    set has-packet? false
+    record-inference-summary action reachable?
+    stop
+  ]
+
+  ;; Кандидаты на следующий шаг
+  let candidates link-neighbors with [color = blue and energy > 0 and failure-ticks = 0]
+  if not any? candidates [
+    if silent-mode? = false [ output-print "Пакет потерян: нет живых синих соседей." ]
+    if packet != nobody [ ask packet [ die ] ]
+    set packet nobody
+    set has-packet? false
+    record-inference-summary action reachable?
+    stop
+  ]
+
+  ;; Подготовка позиционного вектора для роевых алгоритмов
+  let dir ifelse-value (dest = one-of turtles with [color = red and label = "D"]) [0] [1]
+  let pos-vector []
+  if algo = "GWO" [ set pos-vector algo-get self dir idx-leader1-pos ]
+  if algo = "FSS" [ set pos-vector algo-get self dir idx-leader1-pos ]
+  if algo = "SMO" [ set pos-vector algo-get self dir idx-leader2-pos ]
+  if not is-list? pos-vector [ set pos-vector [] ]
+
+  let all-ordinary sort turtles with [color = blue]
+  let chosen nobody
+
+  ;; ====== DSR: распределённый поиск и кэширование ======
+  if algo = "DSR" [
+    ;; Попытаться взять маршрут из кэша
+    let cached dsr-lookup-cache self dest
+    ifelse not empty? cached [
+      ;; Есть маршрут – найти в нём себя и передать следующему
+      let pos position who cached
+      if pos != false and pos < (length cached - 1) [
+        let next-id item (pos + 1) cached
+        let next-node turtle next-id
+        if next-node != nobody and link-with next-node != nobody [
+          set chosen next-node
+        ]
+      ]
+      ;; Если кэшированный маршрут не сработал – удаляем его
+      if chosen = nobody [
+        let old-cache dsr-cache
+        let new-cache []
+        let dest-id [who] of dest
+        let i 0
+        while [i < length old-cache] [
+          let entry item i old-cache
+          if item 0 entry != dest-id [
+            set new-cache lput entry new-cache
+          ]
+          set i i + 1
+        ]
+        set dsr-cache new-cache
+      ]
+    ] [ ]
+
+    ;; Если chosen всё ещё nobody – запускаем распределённый поиск
+    if chosen = nobody [
+      let discovered dsr-discover-route self dest 5
+      if not empty? discovered [
+        let pos position who discovered
+        if pos != false and pos < (length discovered - 1) [
+          set chosen turtle (item (pos + 1) discovered)
+        ]
+      ]
+    ]
+
+    ;; Если после всех попыток chosen отсутствует – пакет потерян
+    if chosen = nobody [
+      if silent-mode? = false [
+        ifelse empty? dsr-lookup-cache self dest [
+          output-print "DSR: не удалось найти маршрут."
+        ] [
+          output-print "DSR: маршрут недействителен и поиск не дал результата."
+        ]
+      ]
+      if packet != nobody [ ask packet [ die ] ]
+      set packet nobody
+      set has-packet? false
+      record-inference-summary action reachable?
+      stop
+    ]
+  ]
+
+  ;; ====== Роевые алгоритмы (GWO, FSS, SMO) – ε-жадный выбор ======
+  if algo != "DSR" [
+    ifelse random-float 1.0 < epsilon [
+      set chosen one-of candidates
+      if silent-mode? = false [
+        output-print (word "  [Принятие решения] ε-жадный (исследование) -> случайный выбор дрона " [label] of chosen)
+      ]
+    ] [
+      ;; Эксплуатация – вычисляем веса для всех кандидатов
+      let weight-list []
+      let my-dist distance dest   ;; расстояние от текущего дрона до цели (нужно для GWO)
+      foreach sort candidates [ c ->
+        let raw-weight ifelse-value (position c all-ordinary != false and not empty? pos-vector)
+          [ item (position c all-ordinary) pos-vector ]
+          [ 0 ]
+        let penalty (1 + visit-penalty-factor * get-visit-count [who] of c)
+        let final-weight raw-weight / penalty
+        ;; Географическая коррекция для GWO
+        if algo = "GWO" [
+          let dist-to-target [distance dest] of c
+          ifelse dist-to-target < my-dist [
+            let geo-factor (1 / (1 + dist-to-target / 10))
+            set final-weight (raw-weight * geo-factor) / penalty
+          ] [
+            set final-weight 0.0001   ;; кандидат не приближает к цели – почти не выбираем
+          ]
+        ]
+        set weight-list lput (list c final-weight raw-weight penalty) weight-list
+      ]
+      set weight-list sort-by [ [a b] -> (item 1 a) > (item 1 b) ] weight-list
+      set chosen item 0 (first weight-list)
+
+      if silent-mode? = false [
+        output-print "  [Принятие решения] Эксплуатация – вычисление весов для всех соседей:"
+        output-print "    Позиционный вектор (raw weight) для каждого синего дрона:"
+        let idx 0
+        foreach all-ordinary [ d ->
+          let w ifelse-value (not empty? pos-vector) [ item idx pos-vector ] [ 0 ]
+          output-print (word "      Дрон " [label] of d ": " precision w 4)
+          set idx idx + 1
+        ]
+        output-print (word "    Штраф за посещения (penalty factor = " visit-penalty-factor "):")
+        foreach weight-list [ entry ->
+          let c item 0 entry
+          let final-w item 1 entry
+          let raw-w item 2 entry
+          let pen item 3 entry
+          output-print (word "      Дрон " [label] of c ": raw = " precision raw-w 4
+                            " / " pen " = " precision final-w 4)
+        ]
+        output-print (word "    Выбран дрон " [label] of chosen
+                      " с максимальным весом " precision (item 1 (first weight-list)) 4)
+      ]
+    ]
+  ]
+
+  ;; Проверка на занятость пакетом
+  if [has-packet?] of chosen [
+    if silent-mode? = false [
+      output-print (word "[Предупреждение] Дрон " [label] of chosen " уже имеет пакет, отмена передачи.")
+    ]
+    if packet != nobody [ ask packet [ die ] ]
+    set packet nobody
+    set has-packet? false
+    record-inference-summary action reachable?
+    stop
+  ]
+
+  set packet-hop-count packet-hop-count + 1
+  if packet-hop-count > 50 [
+    if silent-mode? = false [ output-print "Превышен лимит прыжков, пакет потерян." ]
+    if packet != nobody [ ask packet [ die ] ]
+    set packet nobody
+    set has-packet? false
+    record-inference-summary action reachable?
+    stop
+  ]
+
+  if silent-mode? = false [
+    output-print (word "  [Действие] Передаю пакет дрону " [label] of chosen)
+  ]
+  move-packet-to chosen
+  set has-packet? false
+  ask chosen [ set has-packet? true ]
+
+  ;; Расход энергии (не в тестовом режиме)
+  if test-mode? = false [
+    set energy energy - 1
+    if energy < 0 [ set energy 0 ]
+  ]
+
+  if silent-mode? = false [
+    output-print "[Отладка] Конец algo-forward-packet (успешная передача)"
+  ]
+  record-inference-summary action reachable?
+end
+
+;; ============================================================
+;; Перемещение визуального пакета
+;; ============================================================
+to move-packet-to [target]
+  ;; Анимирует перемещение жёлтого квадрата к целевому дрону
+  if packet = nobody [
+    if not silent-mode? [ output-print "[Ошибка] move-packet-to: packet = nobody" ]
+    stop
+  ]
+  if target = nobody [
+    if not silent-mode? [ output-print "[Ошибка] move-packet-to: target = nobody" ]
+    stop
+  ]
+  if not silent-mode? [
+    output-print (word "[Отладка] Перемещаю пакет к дрону " [label] of target)
+  ]
+  ask packet [
+    face target
+    let dist distance target
+    if dist > 0.1 [
+      while [distance target > 0.1] [
+        fd min (list (distance target) 0.1)
+        display
+        wait 0.01
+      ]
+    ]
+    setxy [xcor] of target [ycor] of target
+    if not silent-mode? [
+      output-print (word "[Отладка] Пакет теперь на дроне " [label] of target)
+    ]
+  ]
+end
+
+;; ============================================================
+;; Универсальное обновление обоих направлений
+;; ============================================================
+to algo-update-both-directions [algo]
+  if algo = "DSR" [ stop ]
+  let source one-of turtles with [color = green and label = "S"]
+  let dest   one-of turtles with [color = red and label = "D"]
+  if source = nobody or dest = nobody [ stop ]
+
+  ;; Обновляем только тех дронов, у которых есть валидные данные
+  ask turtles with [
+    is-list? algo-data and
+    length item 0 algo-data > 0       ; проверяем, что популяция не пуста
+  ] [
+    foreach [0 1] [ dir ->
+      let target ifelse-value (dir = 0) [dest] [source]
+      if target != nobody [
+        if algo = "GWO" [ gwo-update-direction dir target ]
+        if algo = "FSS" [ fss-update-direction dir target ]
+        if algo = "SMO" [ smo-update-direction dir target ]
+      ]
+    ]
+  ]
+end
+
+;; ============================================================
+;; GWO: обновление одного направления
+;; ============================================================
+to gwo-update-direction [dir target]
+  let pop          algo-get self dir idx-pop
+  let alpha-pos    algo-get self dir idx-leader1-pos
+  let beta-pos     algo-get self dir idx-leader2-pos
+  let delta-pos    algo-get self dir idx-leader3-pos
+  let counter      algo-get self dir idx-counter
+  let dim length alpha-pos
+
+  ;; Адаптивный коэффициент a (нелинейное убывание)
+  let progress (counter / gwo-max-iter)
+  let a 2 * (1 - progress * progress)
+  if a < 0 [ set a 0 ]
+
+  if not silent-mode? and who = 0 [
+    output-print (word "[LGWO] Итерация " counter ": a = " precision a 2)
+    output-print (word "  Позиция альфа: " map [ v -> precision v 3 ] alpha-pos)
+    output-print (word "  Позиция бета:  " map [ v -> precision v 3 ] beta-pos)
+    output-print (word "  Позиция дельта:" map [ v -> precision v 3 ] delta-pos)
+    output-print (word "  Лучший фитнес: " precision (item 1 (item 0 pop)) 2)
+  ]
+
+  let new-pop map [ wolf ->
+    gwo-update-wolf-lgwo wolf alpha-pos beta-pos delta-pos a dim target
+  ] pop
+
+  set pop sort-by [ [x y] -> (item 1 y) > (item 1 x) ] new-pop
+
+  algo-set self dir idx-pop pop
+  algo-set self dir idx-leader1-pos (item 0 (item 0 pop))
+  algo-set self dir idx-leader1-fit (item 1 (item 0 pop))
+  algo-set self dir idx-leader2-pos (item 0 (item 1 pop))
+  algo-set self dir idx-leader2-fit (item 1 (item 1 pop))
+  algo-set self dir idx-leader3-pos (item 0 (item 2 pop))
+  algo-set self dir idx-leader3-fit (item 1 (item 2 pop))
+
+  ;; Сброс счётчика при достижении max-iter (возобновляет исследование)
+  algo-set self dir idx-counter (counter + 1)
+  if counter + 1 >= gwo-max-iter [
+    algo-set self dir idx-counter 0
+  ]
+end
+
+;; Генератор шага Леви (используется в LGWO)
+to-report levy-step
+  ;; Используем стандартные параметры beta = 1.5
+  let sigma_u 0.6966   ;; значение для beta=1.5
+  let u (random-normal 0 sigma_u)
+  let v (random-normal 0 1)
+  let step ( u / ( (abs v) ^ (1 / 1.5) ) )
+  report step
+end
+
+to-report gwo-update-wolf-lgwo [wolf alpha-pos beta-pos delta-pos a dim target]
+  let pos item 0 wolf
+  let new-pos (n-values dim [0])
+
+  ;; Для каждой координаты
+  let i 0
+  while [i < dim] [
+    ifelse random-float 1.0 < levy-rate [
+      ;; Levy полёт: шаг от текущей позиции в направлении альфа-лидера
+      let step (levy-step * 0.01)          ;; масштабируем шаг
+      let raw-val (item i pos) + step * ((item i alpha-pos) - (item i pos))
+      if raw-val < 0 [ set raw-val 0 ]
+      if raw-val > 1 [ set raw-val 1 ]
+      set new-pos replace-item i new-pos raw-val
+    ] [
+      ;; Стандартный GWO шаг
+      let r1a random-float 1
+      let r2a random-float 1
+      let A1 (2 * a * r1a - a)
+      let C1 (2 * r2a)
+      let D_alpha abs (C1 * (item i alpha-pos) - (item i pos))
+      let X1 (item i alpha-pos) - A1 * D_alpha
+
+      let r1b random-float 1
+      let r2b random-float 1
+      let A2 (2 * a * r1b - a)
+      let C2 (2 * r2b)
+      let D_beta abs (C2 * (item i beta-pos) - (item i pos))
+      let X2 (item i beta-pos) - A2 * D_beta
+
+      let r1c random-float 1
+      let r2c random-float 1
+      let A3 (2 * a * r1c - a)
+      let C3 (2 * r2c)
+      let D_delta abs (C3 * (item i delta-pos) - (item i pos))
+      let X3 (item i delta-pos) - A3 * D_delta
+
+      let raw-val (X1 + X2 + X3) / 3
+      if raw-val < 0 [ set raw-val 0 ]
+      if raw-val > 1 [ set raw-val 1 ]
+      set new-pos replace-item i new-pos raw-val
+    ]
+    set i i + 1
+  ]
+
+  ;; Мутация (оставляем, она помогает разнообразию)
+  if random-float 1.0 < mutation-rate [
+    let mutate-dim random dim
+    set new-pos replace-item mutate-dim new-pos (random-float 1.0)
+  ]
+
+  ;; Мягкая географическая коррекция (такая же, как раньше)
+  let all-ordinary sort turtles with [color = blue]
+  let n-blue length all-ordinary
+  set i 0
+  while [i < n-blue] [
+    let drone item i all-ordinary
+    let dist distance target
+    let geo-bonus 0.1 * (1 / (1 + dist / 10))
+    let cur-val item i new-pos
+    set new-pos replace-item i new-pos clamp01 (cur-val + geo-bonus)
+    set i i + 1
+  ]
+
+  let p build-greedy-path self target new-pos
+  let fit ifelse-value (empty? p) [ INVALID-FIT ] [ fitness-of-path p self target ]
+  report (list new-pos fit)
+end
+
+;; ============================================================
+;; FSS: обновление одного направления
+;; ============================================================
+to fss-update-direction [dir target]
+  let pop        algo-get self dir idx-pop
+  let best-pos   algo-get self dir idx-leader1-pos
+  if empty? best-pos [ stop ]
+  let dim length best-pos
+
+  ;; Предварительная оценка фитнеса всех рыб (без изменений)
+  let updated-pop []
+  foreach pop [ fish ->
+    let pos item 0 fish
+    let w   item 2 fish
+    let p   build-greedy-path self target pos
+    let fit ifelse-value (empty? p) [ INVALID-FIT ] [ fitness-of-path p self target ]
+    set updated-pop lput (list pos fit w) updated-pop
+  ]
+  algo-set self dir idx-pop updated-pop
+
+  ;; Основной цикл FSS
+  repeat fss-max-iter [
+    set pop algo-get self dir idx-pop
+    let step-ind fss-step-ind-init * (1 - iter-counter / 100)
+
+    ;; Шаг 1: Индивидуальное плавание
+    let new-pop []
+    let max-delta 0
+    let delta-list []
+    foreach pop [ fish ->
+      let old-pos item 0 fish
+      let old-fit item 1 fish
+      let w       item 2 fish
+      let new-pos map [ val -> clamp01 (val + (random-float 2.0 - 1.0) * step-ind) ] old-pos
+      let p   build-greedy-path self target new-pos
+      let new-fit ifelse-value (empty? p) [ INVALID-FIT ] [ fitness-of-path p self target ]
+      let delta new-fit - old-fit
+      if delta > max-delta [ set max-delta delta ]
+      set delta-list lput delta delta-list
+      set new-pop lput (list old-pos old-fit w new-pos new-fit delta) new-pop
+    ]
+
+    ;; Обновление весов и формирование pop2
+    let pop2 []
+    let delta-f-list []
+    let delta-x-list []
+    foreach new-pop [ rec ->
+      let old-pos item 0 rec
+      let old-fit item 1 rec
+      let w item 2 rec
+      let new-pos item 3 rec
+      let new-fit item 4 rec
+      let delta item 5 rec
+
+      ifelse delta > 0 [
+        if max-delta > 0 [
+          set w w + (delta / max-delta)
+          if w > 5.0 [ set w 5.0 ]
+          if w < 1.0 [ set w 1.0 ]
+        ]
+        let displacement (map [ [a b] -> a - b ] new-pos old-pos)
+        set delta-f-list lput delta delta-f-list
+        set delta-x-list lput displacement delta-x-list
+        set pop2 lput (list new-pos new-fit w) pop2
+      ] [
+        set delta-f-list lput 0 delta-f-list
+        set delta-x-list lput (n-values dim [0]) delta-x-list
+        set pop2 lput (list old-pos old-fit w) pop2
+      ]
+    ]
+
+    ;; Шаг 2: Инстинктивно-коллективное движение
+    let sum-delta-f sum delta-f-list
+    if sum-delta-f > 0 [
+      let weighted-sum (n-values dim [0])
+      (foreach delta-x-list delta-f-list [ [disp df] ->
+        set weighted-sum (map [ [ws d] -> ws + d * df ] weighted-sum disp)
+      ])
+      let m-vector map [ s -> s / sum-delta-f ] weighted-sum
+      let pop3 []
+      foreach pop2 [ fish ->
+        let pos item 0 fish
+        let fit item 1 fish
+        let w item 2 fish
+        let new-pos (map [ [p mv] -> clamp01 (p + mv) ] pos m-vector)
+        set pop3 lput (list new-pos fit w) pop3
+      ]
+      set pop2 pop3
+    ]
+
+    ;; Шаг 3: Коллективно-волевое движение
+    let total-weight-before sum (map [ f -> item 2 f ] pop)
+    let total-weight-after  sum (map [ f -> item 2 f ] pop2)
+    let vol-direction ifelse-value (total-weight-after > total-weight-before) [ -1 ] [ 1 ]
+    let step-vol fss-step-vol-init * (1 - iter-counter / 100)
+
+    let barycenter (n-values dim [0])
+    if total-weight-after > 0 [
+      let weighted-pos (n-values dim [0])
+      foreach pop2 [ fish ->
+        let pos item 0 fish
+        let w item 2 fish
+        set weighted-pos (map [ [wp p] -> wp + p * w ] weighted-pos pos)
+      ]
+      set barycenter map [ wp -> wp / total-weight-after ] weighted-pos
+    ]
+
+    let pop4 []
+    foreach pop2 [ fish ->
+      let pos item 0 fish
+      let fit item 1 fish
+      let w item 2 fish
+      let diff (map [ [p b] -> p - b ] pos barycenter)
+      let shift map [ d -> vol-direction * d * random-float step-vol ] diff
+      let new-pos (map [ [p s] -> clamp01 (p + s) ] pos shift)
+      set pop4 lput (list new-pos fit w) pop4
+    ]
+
+    ;; Обновляем фитнес после всех движений
+    let final-pop []
+    foreach pop4 [ fish ->
+      let pos item 0 fish
+      let w item 2 fish
+      let p build-greedy-path self target pos
+      let fit ifelse-value (empty? p) [ INVALID-FIT ] [ fitness-of-path p self target ]
+      set final-pop lput (list pos fit w) final-pop
+    ]
+
+    algo-set self dir idx-pop final-pop
+  ]
+
+  ;; Обновляем лучшую позицию дрона (игнорируем тупики)
+  set pop algo-get self dir idx-pop
+  let best-fit INVALID-FIT
+  let best-pos-item []
+  foreach pop [ fish ->
+    let fit item 1 fish
+    if fit > best-fit and fit > (INVALID-FIT + 1e8) [
+      set best-fit fit
+      set best-pos-item item 0 fish
+    ]
+  ]
+  if best-fit > (INVALID-FIT + 1e8) [
+    algo-set self dir idx-leader1-pos best-pos-item
+    algo-set self dir idx-leader1-fit best-fit
+  ]
+end
+
+;; Ограничить значение в диапазоне [0, 1]
+to-report clamp01 [x]
+  if x < 0 [ report 0 ]
+  if x > 1 [ report 1 ]
+  report x
+end
+
+;; ============================================================
+;; SMO: обновление одного направления
+;; ============================================================
+to smo-update-direction [dir target]
+  let pop               algo-get self dir idx-pop
+  let local-leader-pos  algo-get self dir idx-leader1-pos
+  let local-leader-fit  algo-get self dir idx-leader1-fit
+  let global-leader-pos algo-get self dir idx-leader2-pos
+  let global-leader-fit algo-get self dir idx-leader2-fit
+  let local-limit-count algo-get self dir idx-local-limit-count
+  let global-limit-count algo-get self dir idx-global-limit-count
+
+  let dimension length local-leader-pos
+
+  if not silent-mode? and who = 0 [
+    output-print (word "[SMO] Итерация " iter-counter ":")
+    output-print (word "  Локальный лидер: " map [ v -> precision v 3 ] local-leader-pos)
+    output-print (word "  Глобальный лидер: " map [ v -> precision v 3 ] global-leader-pos)
+    output-print (word "  Лок. лимит: " local-limit-count " / " smo-local-leader-limit)
+    output-print (word "  Глоб. лимит: " global-limit-count " / " smo-global-leader-limit)
+  ]
+
+  ;; Оцениваем фитнес всех обезьян
+  let updated-pop []
+  foreach pop [ monkey ->
+    let pos item 0 monkey
+    let p build-greedy-path self target pos
+    let fit ifelse-value (empty? p) [ INVALID-FIT ] [ fitness-of-path p self target ]
+    set updated-pop lput (list pos fit) updated-pop
+  ]
+  set pop updated-pop
+
+  ;; Local Leader Phase
+  let new-pop []
+  foreach pop [ monkey ->
+    let old-pos item 0 monkey
+    let new-pos (n-values dimension [0])
+    let i 0
+    while [i < dimension] [
+      let r1 random-float 1.0
+      ifelse r1 >= smo-perturbation-rate [
+        let random-monkey one-of pop
+        let random-pos item 0 random-monkey
+        let val (item i old-pos) +
+                random-float 1.0 * ((item i local-leader-pos) - (item i old-pos)) +
+                random-float 1.0 * ((item i random-pos) - (item i old-pos))
+        set new-pos replace-item i new-pos (clamp01 val)
+      ] [
+        set new-pos replace-item i new-pos (item i old-pos)
+      ]
+      set i i + 1
+    ]
+    let p build-greedy-path self target new-pos
+    let new-fit ifelse-value (empty? p) [ INVALID-FIT ] [ fitness-of-path p self target ]
+    set new-pop lput (list new-pos new-fit) new-pop
+  ]
+  set pop new-pop
+
+  ;; Global Leader Phase
+  set new-pop []
+  foreach pop [ monkey ->
+    let old-pos item 0 monkey
+    let new-pos (n-values dimension [0])
+    let i 0
+    while [i < dimension] [
+      let r1 random-float 1.0
+      ifelse r1 < smo-perturbation-rate [
+        let random-monkey one-of pop
+        let random-pos item 0 random-monkey
+        let val (item i old-pos) +
+                random-float 1.0 * ((item i global-leader-pos) - (item i old-pos)) +
+                random-float 1.0 * ((item i random-pos) - (item i old-pos))
+        set new-pos replace-item i new-pos (clamp01 val)
+      ] [
+        set new-pos replace-item i new-pos (item i old-pos)
+      ]
+      set i i + 1
+    ]
+    let p build-greedy-path self target new-pos
+    let new-fit ifelse-value (empty? p) [ INVALID-FIT ] [ fitness-of-path p self target ]
+    set new-pop lput (list new-pos new-fit) new-pop
+  ]
+  set pop new-pop
+
+  ;; Обновление локального лидера (только среди валидных)
+  let old-local-leader-pos local-leader-pos
+  let best-local-pos []
+  let best-local-fit INVALID-FIT
+  foreach pop [ monkey ->
+    let fit item 1 monkey
+    if fit > best-local-fit and fit > (INVALID-FIT + 1e8) [
+      set best-local-fit fit
+      set best-local-pos item 0 monkey
+    ]
+  ]
+  if best-local-fit > (INVALID-FIT + 1e8) [
+    set local-leader-pos best-local-pos
+    set local-leader-fit best-local-fit
+  ]
+
+  ifelse local-leader-pos != old-local-leader-pos [
+    set local-limit-count 0
+  ] [
+    set local-limit-count local-limit-count + 1
+  ]
+
+  ;; Обновление глобального лидера
+  let old-global-leader-pos global-leader-pos
+  if local-leader-fit > global-leader-fit [
+    set global-leader-pos local-leader-pos
+    set global-leader-fit local-leader-fit
+  ]
+
+  ifelse global-leader-pos != old-global-leader-pos [
+    set global-limit-count 0
+  ] [
+    set global-limit-count global-limit-count + 1
+  ]
+
+  ;; Local Leader Decision
+  if local-limit-count > smo-local-leader-limit [
+    set local-limit-count 0
+    set new-pop []
+    foreach pop [ monkey ->
+      let old-pos item 0 monkey
+      let new-pos (n-values dimension [0])
+      let i 0
+      while [i < dimension] [
+        let val (item i old-pos) +
+                random-float 1.0 * ((item i global-leader-pos) - (item i old-pos)) +
+                random-float 1.0 * ((item i old-pos) - (item i local-leader-pos))
+        set new-pos replace-item i new-pos (clamp01 val)
+        set i i + 1
+      ]
+      let p build-greedy-path self target new-pos
+      let new-fit ifelse-value (empty? p) [ INVALID-FIT ] [ fitness-of-path p self target ]
+      set new-pop lput (list new-pos new-fit) new-pop
+    ]
+    set pop new-pop
+
+    set best-local-fit INVALID-FIT
+    foreach pop [ monkey ->
+      let fit item 1 monkey
+      if fit > best-local-fit and fit > (INVALID-FIT + 1e8) [
+        set best-local-fit fit
+        set best-local-pos item 0 monkey
+      ]
+    ]
+    if best-local-fit > (INVALID-FIT + 1e8) [
+      set local-leader-pos best-local-pos
+      set local-leader-fit best-local-fit
+    ]
+  ]
+
+  ;; Global Leader Decision
+  if global-limit-count > smo-global-leader-limit [
+    set global-limit-count 0
+    set new-pop []
+    foreach pop [ monkey ->
+      let old-pos item 0 monkey
+      let new-pos (n-values dimension [0])
+      let i 0
+      while [i < dimension] [
+        ifelse random-float 1.0 < 0.5 [
+          set new-pos replace-item i new-pos (random-float 1.0)
+        ] [
+          set new-pos replace-item i new-pos (item i old-pos)
+        ]
+        set i i + 1
+      ]
+      let p build-greedy-path self target new-pos
+      let new-fit ifelse-value (empty? p) [ INVALID-FIT ] [ fitness-of-path p self target ]
+      set new-pop lput (list new-pos new-fit) new-pop
+    ]
+    set pop new-pop
+
+    set best-local-fit INVALID-FIT
+    foreach pop [ monkey ->
+      let fit item 1 monkey
+      if fit > best-local-fit and fit > (INVALID-FIT + 1e8) [
+        set best-local-fit fit
+        set best-local-pos item 0 monkey
+      ]
+    ]
+    if best-local-fit > (INVALID-FIT + 1e8) [
+      set local-leader-pos best-local-pos
+      set local-leader-fit best-local-fit
+    ]
+  ]
+
+  ;; Сохраняем данные
+  algo-set self dir idx-pop pop
+  algo-set self dir idx-leader1-pos local-leader-pos
+  algo-set self dir idx-leader1-fit local-leader-fit
+  algo-set self dir idx-leader2-pos global-leader-pos
+  algo-set self dir idx-leader2-fit global-leader-fit
+  algo-set self dir idx-local-limit-count local-limit-count
+  algo-set self dir idx-global-limit-count global-limit-count
+end
+
+;; ============================================================
+;; Универсальная процедура запуска одного направления
+;; ============================================================
+to-report run-one-way [algo source-label dest-label silent? visual?]
+  ;; Запускает передачу пакета из источника в приёмник, возвращает список меток пути.
+  ;; Поддерживает любые узлы (S, D и синие).
+  let old-silent silent-mode?
+  set silent-mode? silent?
+
+  ask turtles [ set has-packet? false ]
+  set visited-for-packet []
+  reset-visit-counts
+  set packet-hop-count 0
+
+  ;; Ищем источник и получатель только по метке (активные узлы)
+  let source one-of turtles with [label = source-label and energy > 0 and failure-ticks = 0]
+  let dest   one-of turtles with [label = dest-label   and energy > 0 and failure-ticks = 0]
+
+  if source = nobody or dest = nobody [
+    if not silent? [ output-print (word "Не найден активный источник " source-label " или приёмник " dest-label) ]
+    set silent-mode? old-silent
+    set route-summary ""
+    report []
+  ]
+
+  set current-source source
+  set current-dest dest
+
+  ask source [ set has-packet? true ]
+  set visited-for-packet lput [who] of source visited-for-packet
+
+  ;; Создаём визуальный пакет, если visual? = true
+  if visual? [
+    if packet != nobody [ ask packet [ die ] ]
+    create-turtles 1 [
+      set shape "square"
+      set color yellow
+      set size 0.3
+      set label "P"
+      set label-color black
+      setxy [xcor] of source [ycor] of source
+      set packet self
+      set algo-data 0
+      set has-packet? false
+    ]
+    if not silent? [
+      output-print (word "Пакет отправлен из " source-label " (алгоритм " algo ").")
+    ]
+  ]
+
+  let steps 0
+  let first-summary ""   ;; запоминаем первое решение ЭС
+  while [any? turtles with [has-packet?] and [has-packet?] of dest != true and steps < 100] [
+    update-connections
+
+    let sender one-of turtles with [has-packet? = true]
+    if sender != nobody [
+      if visual? and not silent? [
+        output-print (word "[Цикл] Шаг " steps ", пакет у дрона " [label] of sender)
+      ]
+      ask sender [ algo-forward-packet algo ]
+      ;; после первой передачи сохраняем сводку
+      if steps = 0 [ set first-summary last-inference-summary ]
+    ]
+
+    set update-tick update-tick + 1
+    if update-tick mod 2 = 0 [
+      algo-update-both-directions algo
+    ]
+
+    tick
+    if visual? [
+      display
+      wait 0.01
+    ]
+    set steps steps + 1
+  ]
+
+  let success? false
+  if [has-packet?] of dest = true [ set success? true ]
+
+  let path-labels (list source-label)
+  foreach visited-for-packet [ id ->
+    let node turtle id
+    if node != source and node != dest [
+      set path-labels lput [label] of node path-labels
+    ]
+  ]
+  if success? [ set path-labels lput dest-label path-labels ]
+
+  if not silent? [
+    if steps >= 1000 [ output-print (word "Достигнут лимит шагов для " source-label " -> " dest-label) ]
+    if packet = nobody [ output-print (word "Пакет потерян на пути " source-label " -> " dest-label) ]
+    if success? [ output-print (word "Пакет успешно доставлен в " dest-label "!") ]
+  ]
+
+  cleanup-packet
+  set silent-mode? old-silent
+  set route-summary first-summary
+  ifelse success? [ report path-labels ] [ report [] ]
+end
+
+;; ============================================================
+;; Одиночные запуски с анимацией (интерфейсные кнопки)
+;; ============================================================
+to run-gwo-distributed
+  update-connections
+  if count turtles with [color = green and label = "S"] = 0 [
+    user-message "Нет начального дрона (S)." stop
+  ]
+  if count turtles with [color = red and label = "D"] = 0 [
+    user-message "Нет конечного дрона (D)." stop
+  ]
+  reinit-all-agents "GWO"
+  init-knowledge-base "GWO"
+  set iter-counter 0
+  reset-timer
+  output-print "=== Запуск передачи S -> D (GWO) ==="
+  let forward-path run-one-way "GWO" "S" "D" false true
+  output-print "=== Запуск передачи D -> S (GWO) ==="
+  let backward-path run-one-way "GWO" "D" "S" false true
+  let elapsed timer
+  output-print "==================== ИТОГОВЫЙ ОТЧЁТ ===================="
+  output-print (word "Маршрут S -> D: " ifelse-value (not empty? forward-path) [forward-path] ["НЕ НАЙДЕН"])
+  output-print (word "Маршрут D -> S: " ifelse-value (not empty? backward-path) [backward-path] ["НЕ НАЙДЕН"])
+  output-print (word "Время выполнения: " precision elapsed 2 " секунд")
+  cleanup-packet
+end
+
+to run-fss-distributed
+  update-connections
+  if count turtles with [color = green and label = "S"] = 0 [
+    user-message "Нет начального дрона (S)." stop
+  ]
+  if count turtles with [color = red and label = "D"] = 0 [
+    user-message "Нет конечного дрона (D)." stop
+  ]
+  reinit-all-agents "FSS"
+  init-knowledge-base "FSS"
+  set iter-counter 0
+  reset-timer
+  output-print "=== Запуск передачи S -> D (FSS) ==="
+  let forward-path run-one-way "FSS" "S" "D" false true
+  output-print "=== Запуск передачи D -> S (FSS) ==="
+  let backward-path run-one-way "FSS" "D" "S" false true
+  let elapsed timer
+  output-print "==================== ИТОГОВЫЙ ОТЧЁТ ===================="
+  output-print (word "Маршрут S -> D: " ifelse-value (not empty? forward-path) [forward-path] ["НЕ НАЙДЕН"])
+  output-print (word "Маршрут D -> S: " ifelse-value (not empty? backward-path) [backward-path] ["НЕ НАЙДЕН"])
+  output-print (word "Время выполнения: " precision elapsed 2 " секунд")
+  cleanup-packet
+end
+
+to run-smo-distributed
+  update-connections
+  if count turtles with [color = green and label = "S"] = 0 [
+    user-message "Нет начального дрона (S)." stop
+  ]
+  if count turtles with [color = red and label = "D"] = 0 [
+    user-message "Нет конечного дрона (D)." stop
+  ]
+  reinit-all-agents "SMO"
+  init-knowledge-base "SMO"
+  set iter-counter 0
+  reset-timer
+  output-print "=== Запуск передачи S -> D (SMO) ==="
+  let forward-path run-one-way "SMO" "S" "D" false true
+  output-print "=== Запуск передачи D -> S (SMO) ==="
+  let backward-path run-one-way "SMO" "D" "S" false true
+  let elapsed timer
+  output-print "==================== ИТОГОВЫЙ ОТЧЁТ ===================="
+  output-print (word "Маршрут S -> D: " ifelse-value (not empty? forward-path) [forward-path] ["НЕ НАЙДЕН"])
+  output-print (word "Маршрут D -> S: " ifelse-value (not empty? backward-path) [backward-path] ["НЕ НАЙДЕН"])
+  output-print (word "Время выполнения: " precision elapsed 2 " секунд")
+  cleanup-packet
+end
+
+to run-dsr-distributed
+  update-connections
+  if count turtles with [color = green and label = "S"] = 0 [
+    user-message "Нет начального дрона (S)." stop
+  ]
+  if count turtles with [color = red and label = "D"] = 0 [
+    user-message "Нет конечного дрона (D)." stop
+  ]
+  reinit-all-agents "DSR"
+  init-knowledge-base "DSR"
+  set iter-counter 0
+  reset-timer
+  output-print "=== Запуск передачи S -> D (DSR) ==="
+  let forward-path run-one-way "DSR" "S" "D" false true
+  output-print "=== Запуск передачи D -> S (DSR) ==="
+  let backward-path run-one-way "DSR" "D" "S" false true
+  let elapsed timer
+  output-print "==================== ИТОГОВЫЙ ОТЧЁТ ===================="
+  output-print (word "Маршрут S -> D: " ifelse-value (not empty? forward-path) [forward-path] ["НЕ НАЙДЕН"])
+  output-print (word "Маршрут D -> S: " ifelse-value (not empty? backward-path) [backward-path] ["НЕ НАЙДЕН"])
+  output-print (word "Время выполнения: " precision elapsed 2 " секунд")
+  cleanup-packet
+end
+
+;; ============================================================
+;; Циклы из 100 отправок (используют быстрый режим silent=true)
+;; ============================================================
+to run-gwo-loop-distributed
+  reinit-all-agents "GWO"
+  run-algo-loop "GWO"
+end
+
+to run-fss-loop-distributed
+  reinit-all-agents "FSS"
+  run-algo-loop "FSS"
+end
+
+to run-smo-loop-distributed
+  reinit-all-agents "SMO"
+  run-algo-loop "SMO"
+end
+
+to run-dsr-loop-distributed
+  reinit-all-agents "DSR"
+  run-algo-loop "DSR"
+end
+
+to run-algo-loop [algo]
+  ;; Цикл из 100 отправок пакетов с периодической сводкой обучения
+  let total-steps 100
+  let success-count 0
+
+  output-print (word "==================== ЗАПУСК ЦИКЛА РАСПРЕДЕЛЁННОГО "
+                    algo " (100 ПАКЕТОВ) ====================")
+  output-print (word "Параметры: visit-penalty-factor = " visit-penalty-factor
+                ", epsilon = " epsilon
+                ", hop-penalty = " hop-penalty
+                ", energy-weight = " energy-weight)
+  if algo = "GWO" [
+    output-print (word "  pop-size = " gwo-pop-size
+                  ", max-iter = " gwo-max-iter
+                  ", mutation-rate = " mutation-rate)
+  ]
+  if algo = "FSS" [
+    output-print (word "  pop-size = " fss-pop-size
+                  ", step-ind-init = " fss-step-ind-init
+                  ", step-vol-init = " fss-step-vol-init
+                  ", max-iter = " fss-max-iter)
+  ]
+  if algo = "SMO" [
+    output-print (word "  pop-size = " smo-pop-size
+                  ", local-leader-limit = " smo-local-leader-limit
+                  ", global-leader-limit = " smo-global-leader-limit
+                  ", pr = " smo-perturbation-rate)
+  ]
+  reset-timer
+  output-print "Состояние сети в начале цикла:"
+  update-drone-info false
+
+  ;; Инициализация экспертной системы и счётчика итераций
+  init-knowledge-base algo
+  set iter-counter 0
+
+  let step-nr 0
+  repeat total-steps [
+    set step-nr step-nr + 1
+    set iter-counter step-nr
+
+    ;; Настройка epsilon: для GWO фиксируем 0.2, для остальных убывает
+    ifelse algo = "GWO" [
+      set epsilon 0.2
+    ] [
+      set epsilon max (list 0.05 (0.3 * (1 - step-nr / total-steps)))
+    ]
+
+    let source one-of turtles with [color = green and label = "S"]
+    let dest   one-of turtles with [color = red and label = "D"]
+
+    ifelse source = nobody or dest = nobody [
+      output-print (word "Шаг " step-nr ": нет S или D")
+    ] [
+      let forward-path run-one-way algo "S" "D" true false
+      let backward-path run-one-way algo "D" "S" true false
+
+      ifelse not empty? forward-path and not empty? backward-path [
+        set success-count success-count + 1
+        let forward-fitness fitness-of-path (map-label-path-to-who forward-path) source dest
+        let backward-fitness fitness-of-path (map-label-path-to-who backward-path) dest source
+        output-print (word "Шаг " step-nr ": УСПЕХ")
+        output-print (word "  S->D путь: " forward-path " фитнес: " forward-fitness)
+        output-print (word "  D->S путь: " backward-path " фитнес: " backward-fitness)
+
+        consume-energy-on-path (map-label-path-to-who forward-path)
+        consume-energy-on-path (map-label-path-to-who backward-path)
+      ] [
+        output-print (word "Шаг " step-nr ": НЕУДАЧА (путь не найден)")
+      ]
+    ]
+
+    apply-random-failures
+    move-drones false
+
+    ;; Каждые 10 шагов показываем состояние обучения роевого алгоритма
+    if step-nr mod 10 = 0 [
+      show-learning-status algo
+    ]
+  ]
+
+  restore-all-drones
+  update-connections
+
+  output-print (word "==================== ЦИКЛ " algo " ЗАВЕРШЁН ====================")
+  output-print "Состояние сети после цикла:"
+  update-drone-info false
+
+  output-print "==================== СВОДКА ===================="
+  output-print (word "Успешных отправок: " success-count " из " total-steps)
+  let elapsed timer
+  output-print (word "Время выполнения цикла: " elapsed " секунд")
+  output-print "============================================================="
+end
+
+;; Преобразует путь из меток в список who
+to-report map-label-path-to-who [label-path]
+  let result []
+  foreach label-path [ lbl ->
+    let t find-drone-by-label lbl
+    if t != nobody [
+      set result lput [who] of t result
+    ]
+  ]
+  report result
+end
+
+;; Расход энергии на маршруте
+to consume-energy-on-path [path]
+  if test-mode? = true [ stop ]
+  foreach path [ node-id ->
+    ask turtle node-id [
+      set energy energy - 1
+      if energy < 0 [ set energy 0 ]
+    ]
+  ]
+end
+
+;; ============================================================
+;; База знаний и экспертная система
+;; ============================================================
+
+;; Инициализирует базу знаний для конкретного алгоритма
+to init-knowledge-base [algo]
+  set knowledge-base []
+  if algo = "GWO" [
+    set knowledge-base lput ["прямая видимость цели" "передать напрямую"] knowledge-base
+    set knowledge-base lput ["есть соседи и альфа-волк существует" "выбрать соседа по весу GWO"] knowledge-base
+    set knowledge-base lput ["нет соседей" "пакет потерян"] knowledge-base
+    set knowledge-base lput ["режим эксплуатации (a < 0.5)" "усилить локальный поиск"] knowledge-base
+    set knowledge-base lput ["режим исследования (a >= 0.5)" "поощрять случайные переходы"] knowledge-base
+  ]
+  if algo = "FSS" [
+    set knowledge-base lput ["прямая видимость цели" "передать напрямую"] knowledge-base
+    set knowledge-base lput ["есть соседи и лучшая рыба существует" "выбрать соседа по весу FSS"] knowledge-base
+    set knowledge-base lput ["нет соседей" "пакет потерян"] knowledge-base
+    set knowledge-base lput ["шаг индивид. плавания > 0.3" "активное исследование окрестностей"] knowledge-base
+    set knowledge-base lput ["шаг волевого движения < 0.1" "стабилизация роя"] knowledge-base
+  ]
+  if algo = "SMO" [
+    set knowledge-base lput ["прямая видимость цели" "передать напрямую"] knowledge-base
+    set knowledge-base lput ["есть соседи и глобальный лидер существует" "выбрать соседа по весу SMO"] knowledge-base
+    set knowledge-base lput ["есть соседи и локальный лидер существует" "выбрать соседа по весу SMO"] knowledge-base
+    set knowledge-base lput ["нет соседей" "пакет потерян"] knowledge-base
+    set knowledge-base lput ["лимит локального лидера превышен" "переформировать локальные группы"] knowledge-base
+    set knowledge-base lput ["лимит глобального лидера превышен" "инициировать глобальную реструктуризацию"] knowledge-base
+  ]
+  if algo = "DSR" [
+    set knowledge-base lput ["прямая видимость цели" "передать напрямую"] knowledge-base
+    set knowledge-base lput ["есть соседи" "использовать DSR маршрут"] knowledge-base
+    set knowledge-base lput ["нет соседей" "пакет потерян"] knowledge-base
+  ]
+  set current-algo algo
+end
+
+;; Сбор фактов о текущем дроне и окружении
+to-report collect-facts [agent dest]
+  let facts []
+
+  ; Прямая видимость цели
+  ifelse [link-with dest] of agent != nobody [
+    set facts lput "прямая видимость цели" facts
+  ] [
+    set facts lput "нет прямой видимости цели" facts
+  ]
+
+  ; Наличие соседей (синие дроны с энергией > 0 и не в отказе)
+  let nbrs ([link-neighbors] of agent) with [color = blue and energy > 0 and failure-ticks = 0]
+  let has-neighbors? any? nbrs
+  ifelse has-neighbors? [
+    set facts lput "есть соседи" facts
+  ] [
+    set facts lput "нет соседей" facts
+  ]
+
+  ; Специфичные факты по алгоритмам
+  if current-algo = "GWO" [
+    let alpha-pos algo-get agent 0 idx-leader1-pos
+    let beta-pos  algo-get agent 0 idx-leader2-pos
+    let delta-pos algo-get agent 0 idx-leader3-pos
+    if not empty? alpha-pos [
+      set facts lput "альфа-волк существует" facts
+      if has-neighbors? [ set facts lput "есть соседи и альфа-волк существует" facts ]
+    ]
+    if not empty? beta-pos  [ set facts lput "бета-волк существует" facts ]
+    if not empty? delta-pos [ set facts lput "дельта-волк существует" facts ]
+
+    ; Параметры GWO
+    let counter algo-get agent 0 idx-counter
+    let a 2 - 2 * (counter / 100)
+    set facts lput (word "коэффициент a = " precision a 2) facts
+    if a < 0.5 [ set facts lput "режим эксплуатации (a < 0.5)" facts ]
+    if a >= 0.5 [ set facts lput "режим исследования (a >= 0.5)" facts ]
+    set facts lput (word "номер итерации = " counter) facts
+  ]
+
+  if current-algo = "FSS" [
+    let best-pos algo-get agent 0 idx-leader1-pos
+    if not empty? best-pos [
+      set facts lput "лучшая рыба существует" facts
+      if has-neighbors? [ set facts lput "есть соседи и лучшая рыба существует" facts ]
+    ]
+    ; Параметры FSS
+    let step-ind fss-step-ind-init * (1 - iter-counter / 100)
+    let step-vol fss-step-vol-init * (1 - iter-counter / 100)
+    set facts lput (word "шаг индивид. плавания = " precision step-ind 2) facts
+    set facts lput (word "шаг волевого движения = " precision step-vol 2) facts
+    set facts lput (word "номер итерации = " iter-counter) facts
+  ]
+
+  if current-algo = "SMO" [
+    let local-pos  algo-get agent 0 idx-leader1-pos
+    let global-pos algo-get agent 0 idx-leader2-pos
+    if not empty? local-pos [
+      set facts lput "локальный лидер существует" facts
+      if has-neighbors? [ set facts lput "есть соседи и локальный лидер существует" facts ]
+    ]
+    if not empty? global-pos [
+      set facts lput "глобальный лидер существует" facts
+      if has-neighbors? [ set facts lput "есть соседи и глобальный лидер существует" facts ]
+    ]
+    ; Параметры SMO
+    set facts lput (word "лимит локального лидера = " smo-local-leader-limit) facts
+    set facts lput (word "лимит глобального лидера = " smo-global-leader-limit) facts
+    set facts lput (word "вероятность возмущения = " precision smo-perturbation-rate 2) facts
+  ]
+
+  ; Дополнительные факты
+  let nbr-count count nbrs
+  set facts lput (word "количество соседей = " nbr-count) facts
+  if nbr-count > 0 [
+    let avg-dist mean [ distance dest ] of nbrs
+    set facts lput (word "среднее расстояние соседей до цели = " precision avg-dist 2) facts
+  ]
+
+  set facts lput (word "алгоритм " current-algo) facts
+  report facts
+end
+
+;; Прямой вывод: применяет правила к фактам и возвращает действие
+to-report forward-chain [facts]
+  set inference-log []
+  let chosen-action "нет действия"
+  foreach knowledge-base [ rule ->
+    let condition item 0 rule
+    let action    item 1 rule
+    if member? condition facts [
+      set inference-log lput (word "  [Прямой вывод] Условие '" condition "' истинно -> действие '" action "'") inference-log
+      set chosen-action action
+      report chosen-action   ; первое подходящее правило
+    ]
+  ]
+  set inference-log lput "  [Прямой вывод] Ни одно правило не сработало." inference-log
+  report chosen-action
+end
+
+;; Обратный вывод: проверяет, достижима ли цель из текущего узла
+to-report backward-chain [agent dest visited]
+  if member? agent visited [ report false ]
+  let new-visited lput agent visited
+
+  ;; Прямая видимость цели – немедленный успех
+  if [link-with dest] of agent != nobody [
+    set inference-log lput (word "  [Обратный вывод] Дрон " [label] of agent " видит цель напрямую.") inference-log
+    report true
+  ]
+
+  ;; Поиск через соседей – преобразуем agentset в список через sort
+  let nbrs ([link-neighbors] of agent) with [color = blue and energy > 0 and failure-ticks = 0]
+  foreach sort nbrs [ n ->
+    if backward-chain n dest new-visited [
+      set inference-log lput (word "  [Обратный вывод] Через дрон " [label] of n " цель достижима.") inference-log
+      report true
+    ]
+  ]
+  report false
+end
+
+;; Сохраняет краткую сводку последнего решения ЭС
+to record-inference-summary [action reachable?]
+  set last-inference-summary (word "ЭС: правило -> " action
+    ", обратный вывод: " ifelse-value reachable? ["цель достижима"]["цель НЕ достижима"])
+end
+
+;; Выводит статус обучения роевого алгоритма с дельтой фитнеса
+to show-learning-status [algo]
+  let source one-of turtles with [color = green and label = "S"]
+  if source = nobody [ stop ]
+  if algo = "DSR" [ stop ]   ; для DSR статус обучения не выводится
+  let fit INVALID-FIT
+  let summary ""
+
+  ifelse algo = "GWO" [
+    let counter algo-get source 0 idx-counter
+    set fit algo-get source 0 idx-leader1-fit
+    let a 2 - 2 * (counter / 100)
+    if a < 0 [ set a 0 ]
+    set summary (word "[GWO] Шаг " iter-counter ": итерация " counter
+      ", a = " precision a 2
+      ", фитнес α = " precision fit 2)
+    if a >= 0.5 [ set summary (word summary " (исследование)") ]
+    if a < 0.5  [ set summary (word summary " (эксплуатация)") ]
+  ] [
+    ifelse algo = "FSS" [
+      set fit algo-get source 0 idx-leader1-fit
+      let step-ind fss-step-ind-init * (1 - iter-counter / 100)
+      let step-vol fss-step-vol-init * (1 - iter-counter / 100)
+      if step-ind < 0 [ set step-ind 0 ]
+      if step-vol < 0 [ set step-vol 0 ]
+      set summary (word "[FSS] Шаг " iter-counter
+        ": фитнес лучшей рыбы = " precision fit 2
+        ", инд.шаг = " precision step-ind 3
+        ", вол.шаг = " precision step-vol 3)
+    ] [
+      ifelse algo = "SMO" [
+        set fit algo-get source 0 idx-leader2-fit
+        let local-lim algo-get source 0 idx-local-limit-count
+        let global-lim algo-get source 0 idx-global-limit-count
+        set summary (word "[SMO] Шаг " iter-counter
+          ": фитнес глоб. лидера = " precision fit 2
+          ", лок.лимит = " local-lim "/" smo-local-leader-limit
+          ", глоб.лимит = " global-lim "/" smo-global-leader-limit)
+        if local-lim > smo-local-leader-limit [
+          set summary (word summary " (переформирование локальных групп)")
+        ]
+        if global-lim > smo-global-leader-limit [
+          set summary (word summary " (глобальная реструктуризация)")
+        ]
+      ] [ stop ]
+    ]
+  ]
+
+  ;; Добавляем дельту, если это не первый замер
+  if fit != INVALID-FIT and prev-fitness != INVALID-FIT [
+    let delta fit - prev-fitness
+    set summary (word summary "   Δ = " precision delta 2)
+  ]
+  if fit != INVALID-FIT [ set prev-fitness fit ]
+
+  ;; Выводим пустую строку для зрительного отделения, затем сводку
+  output-print ""
+  output-print summary
+  output-print ""
+end
+
+;; ============================================================
+;; Тестирование параметров GWO с усреднением по нескольким прогонам
+;; ============================================================
+to-report evaluate-gwo-parameters [pop-size max-iter mut-rate levy-rate-val num-trials]
+  ;; Устанавливаем параметры GWO на время теста
+  set gwo-pop-size pop-size
+  set gwo-max-iter max-iter
+  set mutation-rate mut-rate
+  set levy-rate levy-rate-val
+
+  reinit-all-agents "GWO"
+  init-knowledge-base "GWO"
+  set iter-counter 0
+  update-connections
+
+  let total-fitness 0
+  let successful-trials 0
+
+  let source one-of turtles with [color = green and label = "S"]
+  let dest   one-of turtles with [color = red and label = "D"]
+
+  repeat num-trials [
+    ask turtles [ set has-packet? false ]
+    set visited-for-packet []
+    reset-visit-counts
+
+    let forward-path run-one-way "GWO" "S" "D" true false
+    let backward-path run-one-way "GWO" "D" "S" true false
+
+    let forward-ok? not empty? forward-path
+    let backward-ok? not empty? backward-path
+
+    if forward-ok? and backward-ok? [
+      let f-fit fitness-of-path (map-label-path-to-who forward-path) source dest
+      let b-fit fitness-of-path (map-label-path-to-who backward-path) dest source
+      set total-fitness total-fitness + (f-fit + b-fit) / 2
+      set successful-trials successful-trials + 1
+    ]
+    if forward-ok? and not backward-ok? [
+      set total-fitness total-fitness + fitness-of-path (map-label-path-to-who forward-path) source dest
+      set successful-trials successful-trials + 1
+    ]
+    if not forward-ok? and backward-ok? [
+      set total-fitness total-fitness + fitness-of-path (map-label-path-to-who backward-path) dest source
+      set successful-trials successful-trials + 1
+    ]
+  ]
+
+  ifelse successful-trials > 0 [
+    report total-fitness / successful-trials
+  ] [
+    report INVALID-FIT
+  ]
+end
+
+to run-gwo-parameter-sweep
+  set test-mode? true
+
+  if count turtles with [color = green and label = "S"] = 0 or
+     count turtles with [color = red and label = "D"] = 0 [
+    user-message "Сначала создайте карту (кнопка 'Создать карту')."
+    set test-mode? false
+    stop
+  ]
+
+  clear-output
+  output-print "========================================="
+  output-print "НАЧАЛО ПЕРЕБОРА ПАРАМЕТРОВ GWO (3 значения на параметр)"
+  output-print (word "Зерно карты (текущее random-seed): " test-random-seed)
+  output-print (word "Количество дронов: " count turtles)
+  output-print "========================================="
+
+  let num-trials 30          ; число попыток внутри одного прогона
+  let num-repeats 5          ; число независимых прогонов для усреднения
+
+  ;; Сокращённые диапазоны (по 3 значения)
+  let pop-sizes   [5 12 20]      ; размер популяции
+  let max-iters   [5 10 20]      ; максимальное число итераций
+  let mut-rates   [0.1 0.5 0.9]  ; скорость мутации
+  let levy-values [0.1 0.3 0.5]  ; вероятность Levy-полёта
+
+  let total-combinations (length pop-sizes * length max-iters * length mut-rates * length levy-values)
+  output-print (word "Всего комбинаций: " total-combinations)
+  output-print (word "Попыток в одном прогоне: " num-trials)
+  output-print (word "Число повторов для усреднения: " num-repeats)
+  output-print ""
+
+  let best-fitness INVALID-FIT
+  let best-params []
+  let counter 0
+
+  reset-timer
+
+  foreach pop-sizes [ ps ->
+    foreach max-iters [ mi ->
+      foreach mut-rates [ mr ->
+        foreach levy-values [ lr ->
+          set counter counter + 1
+          output-type (word "[" counter "/" total-combinations "] ps=" ps
+                           " mi=" mi " mr=" precision mr 2 " lr=" precision lr 2 " ... ")
+
+          let repeat-fitnesses []
+          repeat num-repeats [
+            let avg-fit evaluate-gwo-parameters ps mi mr lr num-trials
+            if avg-fit != INVALID-FIT [
+              set repeat-fitnesses lput avg-fit repeat-fitnesses
+            ]
+          ]
+
+          ifelse not empty? repeat-fitnesses [
+            let mean-fitness mean repeat-fitnesses
+            output-print (word "средний фитнес = " precision mean-fitness 2
+                              " (по " length repeat-fitnesses " успешным прогонам из " num-repeats ")")
+            if mean-fitness > best-fitness [
+              set best-fitness mean-fitness
+              set best-params (list ps mi mr lr)
+            ]
+          ] [
+            output-print "нет успешных доставок ни в одном прогоне"
+          ]
+        ]
+      ]
+    ]
+  ]
+
+  let elapsed timer
+
+  output-print ""
+  output-print "========================================="
+  output-print "ПЕРЕБОР ЗАВЕРШЁН"
+  output-print "========================================="
+  ifelse best-fitness != INVALID-FIT [
+    output-print (word "Лучшие параметры GWO (из проверенных):")
+    output-print (word "  gwo-pop-size   = " item 0 best-params)
+    output-print (word "  gwo-max-iter   = " item 1 best-params)
+    output-print (word "  mutation-rate  = " precision (item 2 best-params) 2)
+    output-print (word "  levy-rate      = " precision (item 3 best-params) 2)
+    output-print (word "Средний фитнес: " precision best-fitness 2)
+  ] [
+    output-print "Ни одна комбинация не дала успешных доставок."
+  ]
+  output-print (word "Общее время теста: " precision elapsed 1 " секунд")
+  output-print "========================================="
+
+  set test-mode? false
+end
+
+;; ============================================================
+;; Тестирование параметров FSS
+;; ============================================================
+to-report evaluate-fss-parameters [pop-size step-ind-init step-vol-init max-iter num-trials]
+  set fss-pop-size pop-size
+  set fss-step-ind-init step-ind-init
+  set fss-step-vol-init step-vol-init
+  set fss-max-iter max-iter
+
+  reinit-all-agents "FSS"
+  init-knowledge-base "FSS"
+  set iter-counter 0
+  update-connections
+
+  let total-fitness 0
+  let successful-trials 0
+
+  let source one-of turtles with [color = green and label = "S"]
+  let dest   one-of turtles with [color = red and label = "D"]
+
+  repeat num-trials [
+    ask turtles [ set has-packet? false ]
+    set visited-for-packet []
+    reset-visit-counts
+
+    let forward-path run-one-way "FSS" "S" "D" true false
+    let backward-path run-one-way "FSS" "D" "S" true false
+
+    let forward-ok? not empty? forward-path
+    let backward-ok? not empty? backward-path
+
+    if forward-ok? and backward-ok? [
+      let f-fit fitness-of-path (map-label-path-to-who forward-path) source dest
+      let b-fit fitness-of-path (map-label-path-to-who backward-path) dest source
+      set total-fitness total-fitness + (f-fit + b-fit) / 2
+      set successful-trials successful-trials + 1
+    ]
+    if forward-ok? and not backward-ok? [
+      set total-fitness total-fitness + fitness-of-path (map-label-path-to-who forward-path) source dest
+      set successful-trials successful-trials + 1
+    ]
+    if not forward-ok? and backward-ok? [
+      set total-fitness total-fitness + fitness-of-path (map-label-path-to-who backward-path) dest source
+      set successful-trials successful-trials + 1
+    ]
+  ]
+
+  ifelse successful-trials > 0 [
+    report total-fitness / successful-trials
+  ] [
+    report INVALID-FIT
+  ]
+end
+
+to run-fss-parameter-sweep
+  set test-mode? true
+
+  if count turtles with [color = green and label = "S"] = 0 or
+     count turtles with [color = red and label = "D"] = 0 [
+    user-message "Сначала создайте карту (кнопка 'Создать карту')."
+    set test-mode? false
+    stop
+  ]
+
+  clear-output
+  output-print "========================================="
+  output-print "НАЧАЛО ПЕРЕБОРА ПАРАМЕТРОВ FSS (сокращённый набор, 3 значения на параметр)"
+  output-print (word "Зерно карты (текущее random-seed): " test-random-seed)
+  output-print (word "Количество дронов: " count turtles)
+  output-print "========================================="
+
+  let num-trials 30
+  let num-repeats 5
+
+  ;; Сокращённые диапазоны (по 3 значения)
+  let pop-sizes      [3 10 20]
+  let step-ind-inits [0.05 0.2 0.5]
+  let step-vol-inits [0.05 0.2 0.5]
+  let max-iters      [1 10 20]
+
+  let total-combinations (length pop-sizes * length step-ind-inits * length step-vol-inits * length max-iters)
+  output-print (word "Всего комбинаций: " total-combinations)
+  output-print (word "Попыток в одном прогоне: " num-trials)
+  output-print (word "Число повторов для усреднения: " num-repeats)
+  output-print ""
+
+  let best-fitness INVALID-FIT
+  let best-params []
+  let counter 0
+
+  reset-timer
+
+  foreach pop-sizes [ ps ->
+    foreach step-ind-inits [ si ->
+      foreach step-vol-inits [ sv ->
+        foreach max-iters [ mi ->
+          set counter counter + 1
+          output-type (word "[" counter "/" total-combinations "] ps=" ps
+                           " si=" precision si 2 " sv=" precision sv 2 " mi=" mi " ... ")
+
+          let repeat-fitnesses []
+          repeat num-repeats [
+            let avg-fit evaluate-fss-parameters ps si sv mi num-trials
+            if avg-fit != INVALID-FIT [
+              set repeat-fitnesses lput avg-fit repeat-fitnesses
+            ]
+          ]
+
+          ifelse not empty? repeat-fitnesses [
+            let mean-fitness mean repeat-fitnesses
+            output-print (word "средний фитнес = " precision mean-fitness 2
+                              " (по " length repeat-fitnesses " успешным прогонам из " num-repeats ")")
+            if mean-fitness > best-fitness [
+              set best-fitness mean-fitness
+              set best-params (list ps si sv mi)
+            ]
+          ] [
+            output-print "нет успешных доставок ни в одном прогоне"
+          ]
+        ]
+      ]
+    ]
+  ]
+
+  let elapsed timer
+
+  output-print ""
+  output-print "========================================="
+  output-print "ПЕРЕБОР ЗАВЕРШЁН"
+  output-print "========================================="
+  ifelse best-fitness != INVALID-FIT [
+    output-print (word "Лучшие параметры FSS (из проверенных):")
+    output-print (word "  fss-pop-size      = " item 0 best-params)
+    output-print (word "  fss-step-ind-init = " precision (item 1 best-params) 2)
+    output-print (word "  fss-step-vol-init = " precision (item 2 best-params) 2)
+    output-print (word "  fss-max-iter      = " item 3 best-params)
+    output-print (word "Средний фитнес: " precision best-fitness 2)
+  ] [
+    output-print "Ни одна комбинация не дала успешных доставок."
+  ]
+  output-print (word "Общее время теста: " precision elapsed 1 " секунд")
+  output-print "========================================="
+
+  set test-mode? false
+end
+
+;; ============================================================
+;; Тестирование параметров SMO
+;; ============================================================
+to-report evaluate-smo-parameters [pop-size local-leader-limit global-leader-limit pr num-trials]
+  set smo-pop-size pop-size
+  set smo-local-leader-limit local-leader-limit
+  set smo-global-leader-limit global-leader-limit
+  set smo-perturbation-rate pr
+
+  reinit-all-agents "SMO"
+  init-knowledge-base "SMO"
+  set iter-counter 0
+  update-connections
+
+  let total-fitness 0
+  let successful-trials 0
+
+  let source one-of turtles with [color = green and label = "S"]
+  let dest   one-of turtles with [color = red and label = "D"]
+
+  repeat num-trials [
+    ask turtles [ set has-packet? false ]
+    set visited-for-packet []
+    reset-visit-counts
+
+    let forward-path run-one-way "SMO" "S" "D" true false
+    let backward-path run-one-way "SMO" "D" "S" true false
+
+    let forward-ok? not empty? forward-path
+    let backward-ok? not empty? backward-path
+
+    if forward-ok? and backward-ok? [
+      let f-fit fitness-of-path (map-label-path-to-who forward-path) source dest
+      let b-fit fitness-of-path (map-label-path-to-who backward-path) dest source
+      set total-fitness total-fitness + (f-fit + b-fit) / 2
+      set successful-trials successful-trials + 1
+    ]
+    if forward-ok? and not backward-ok? [
+      set total-fitness total-fitness + fitness-of-path (map-label-path-to-who forward-path) source dest
+      set successful-trials successful-trials + 1
+    ]
+    if not forward-ok? and backward-ok? [
+      set total-fitness total-fitness + fitness-of-path (map-label-path-to-who backward-path) dest source
+      set successful-trials successful-trials + 1
+    ]
+  ]
+
+  ifelse successful-trials > 0 [
+    report total-fitness / successful-trials
+  ] [
+    report INVALID-FIT
+  ]
+end
+
+to run-smo-parameter-sweep
+  set test-mode? true
+
+  if count turtles with [color = green and label = "S"] = 0 or
+     count turtles with [color = red and label = "D"] = 0 [
+    user-message "Сначала создайте карту (кнопка 'Создать карту')."
+    set test-mode? false
+    stop
+  ]
+
+  clear-output
+  output-print "========================================="
+  output-print "НАЧАЛО ПЕРЕБОРА ПАРАМЕТРОВ SMO (сокращённый набор, 3 значения на параметр)"
+  output-print (word "Зерно карты (текущее random-seed): " test-random-seed)
+  output-print (word "Количество дронов: " count turtles)
+  output-print "========================================="
+
+  let num-trials 30
+  let num-repeats 5
+
+  ;; Сокращённые диапазоны (по 3 значения)
+  let pop-sizes     [3 10 20]
+  let local-limits  [5 15 30]
+  let global-limits [10 30 100]
+  let pr-values     [0.1 0.5 0.9]
+
+  let total-combinations (length pop-sizes * length local-limits * length global-limits * length pr-values)
+  output-print (word "Всего комбинаций: " total-combinations)
+  output-print (word "Попыток в одном прогоне: " num-trials)
+  output-print (word "Число повторов для усреднения: " num-repeats)
+  output-print ""
+
+  let best-fitness INVALID-FIT
+  let best-params []
+  let counter 0
+
+  reset-timer
+
+  foreach pop-sizes [ ps ->
+    foreach local-limits [ ll ->
+      foreach global-limits [ gl ->
+        foreach pr-values [ pr ->
+          set counter counter + 1
+          output-type (word "[" counter "/" total-combinations "] ps=" ps
+                           " ll=" ll " gl=" gl " pr=" precision pr 2 " ... ")
+
+          let repeat-fitnesses []
+          repeat num-repeats [
+            let avg-fit evaluate-smo-parameters ps ll gl pr num-trials
+            if avg-fit != INVALID-FIT [
+              set repeat-fitnesses lput avg-fit repeat-fitnesses
+            ]
+          ]
+
+          ifelse not empty? repeat-fitnesses [
+            let mean-fitness mean repeat-fitnesses
+            output-print (word "средний фитнес = " precision mean-fitness 2
+                              " (по " length repeat-fitnesses " успешным прогонам из " num-repeats ")")
+            if mean-fitness > best-fitness [
+              set best-fitness mean-fitness
+              set best-params (list ps ll gl pr)
+            ]
+          ] [
+            output-print "нет успешных доставок ни в одном прогоне"
+          ]
+        ]
+      ]
+    ]
+  ]
+
+  let elapsed timer
+
+  output-print ""
+  output-print "========================================="
+  output-print "ПЕРЕБОР ЗАВЕРШЁН"
+  output-print "========================================="
+  ifelse best-fitness != INVALID-FIT [
+    output-print (word "Лучшие параметры SMO (из проверенных):")
+    output-print (word "  smo-pop-size          = " item 0 best-params)
+    output-print (word "  smo-local-leader-limit = " item 1 best-params)
+    output-print (word "  smo-global-leader-limit= " item 2 best-params)
+    output-print (word "  smo-perturbation-rate  = " precision (item 3 best-params) 2)
+    output-print (word "Средний фитнес: " precision best-fitness 2)
+  ] [
+    output-print "Ни одна комбинация не дала успешных доставок."
+  ]
+  output-print (word "Общее время теста: " precision elapsed 1 " секунд")
+  output-print "========================================="
+
+  set test-mode? false
+end
+
+;; ============================================================
+;; Сохранение и восстановление состояния мира (равные условия)
+;; ============================================================
+
+;; Процедура capture-test-snapshot запоминает точное состояние всех дронов
+;; (координаты, цвета, метки, энергию, радиусы, скорости, счётчики отказов,
+;; форму и размер). Это «фотография» текущей карты, которая будет
+;; использована во всех тестах для обеспечения одинаковых начальных условий
+;; при проверке каждого алгоритма.
+to capture-test-snapshot
+  set test-snapshot []                        ; очищаем старый снимок
+  ask turtles [
+    ;; для каждого дрона сохраняем список характеристик
+    set test-snapshot lput
+      (list who color label xcor ycor energy comm-range speed failure-ticks shape size)
+      test-snapshot
+  ]
+  output-print "Топология сохранена для тестов."
+end
+
+;; Процедура restore-test-snapshot полностью восстанавливает мир
+;; по сохранённому снимку. Она удаляет всех текущих дронов и связи,
+;; затем создаёт новых дронов с точно такими же характеристиками,
+;; какие были в момент вызова capture-test-snapshot.
+;; Это гарантирует, что каждый алгоритм тестируется на идентичной
+;; начальной расстановке и с одинаковыми параметрами узлов.
+to restore-test-snapshot
+  ;; Удаляем всех существующих дронов и связи между ними
+  clear-turtles
+  clear-links
+
+  ;; Для каждой записи в снимке создаём нового дрона
+  foreach test-snapshot [ entry ->
+    ;; Извлекаем сохранённые характеристики (в том же порядке, что при сохранении)
+    let clr item 1 entry      ; цвет
+    let lbl item 2 entry      ; метка (S,D или номер)
+    let x   item 3 entry      ; X координата
+    let y   item 4 entry      ; Y координата
+    let en  item 5 entry      ; энергия
+    let cr  item 6 entry      ; радиус связи
+    let sp  item 7 entry      ; скорость
+    let ft  item 8 entry      ; счётчик отказов (0 = включён)
+    let sh  item 9 entry      ; форма
+    let sz  item 10 entry     ; размер
+
+    create-turtles 1 [
+      set color clr
+      set label lbl
+      setxy x y
+      set energy en
+      set comm-range cr
+      set speed sp
+      set failure-ticks ft
+      set shape sh
+      set size sz
+      set label-color black     ; восстанавливаем чёрный цвет метки
+      set has-packet? false     ; пакетов пока нет
+      set algo-data []          ; очищаем данные алгоритмов (будут переинициализированы)
+    ]
+  ]
+  ;; Восстанавливаем связи на основе текущих координат и радиусов
+  update-connections
+end
+
+
+
+;; ============================================================
+;; ТЕСТ 1 – КОРРЕКТНОСТЬ
+;; Проверяет долю успешно доставленных пакетов (от S к D)
+;; в динамической среде. Перед запуском пакетов алгоритмы
+;; получают 10 итераций обучения на статической топологии.
+;; Движение дронов происходит после каждой попытки передачи,
+;; его траектория абсолютно одинакова для всех алгоритмов
+;; благодаря фиксированному начальному зерну случайных чисел.
+;; ============================================================
+to test-correctness
+  let algo-list ["GWO" "FSS" "SMO" "DSR"]
+  let num-packets 200
+  output-print "==================== ТЕСТ КОРРЕКТНОСТИ ===================="
+  foreach algo-list [ algo ->
+    restore-test-snapshot
+    random-seed 12345
+    set test-mode? true             ; отключаем движение на время обучения
+    reinit-all-agents algo
+    init-knowledge-base algo
+    ;; Подавляем отладочный вывод во время начального обучения
+    let old-silent silent-mode?
+    set silent-mode? true
+    ;; 10 итераций обучения для любого роевого алгоритма
+    if algo != "DSR" [
+      repeat 10 [ algo-update-both-directions algo tick ]
+    ]
+    set silent-mode? old-silent     ; восстанавливаем режим вывода
+    ;; Включаем движение и расход энергии
+    set test-mode? false
+    set epsilon 0.2
+    let successes 0
+    let total 0
+    repeat num-packets [
+      let src one-of turtles with [color = green]
+      let dst one-of turtles with [color = red]
+      if src != nobody and dst != nobody [
+        set visited-for-packet []
+        reset-visit-counts
+        let path run-one-way algo "S" "D" true false   ; бесшумный запуск
+        if is-list? path and not empty? path and last path = "D" [
+          set successes successes + 1
+        ]
+        set total total + 1
+        move-drones false
+        update-connections
+      ]
+    ]
+    output-print (word algo ": доставлено " successes " / " total
+      " (" precision (successes / total * 100) 1 "%)")
+  ]
+end
+
+;; ============================================================
+;; ТЕСТ 2 – ЭФФЕКТИВНОСТЬ (ОПТИМАЛЬНОСТЬ)
+;; Оценивает качество найденных маршрутов: среднее число прыжков,
+;; среднюю суммарную энергию узлов пути и средний фитнес.
+;; Чем короче путь и выше энергия, тем лучше (меньше отрицательный фитнес).
+;; ============================================================
+to test-efficiency
+  let num-packets 200
+  output-print "==================== ТЕСТ ЭФФЕКТИВНОСТИ ===================="
+  foreach ["GWO" "FSS" "SMO" "DSR"] [ algo ->
+    restore-test-snapshot
+    random-seed 12345
+    set test-mode? true
+    reinit-all-agents algo
+    init-knowledge-base algo
+    let old-silent silent-mode?
+    set silent-mode? true
+    if algo != "DSR" [
+      repeat 10 [ algo-update-both-directions algo tick ]
+    ]
+    set silent-mode? old-silent
+    set test-mode? false
+    set epsilon 0.2
+    let total-fitness 0
+    let total-hops 0
+    let total-energy 0
+    let success-count 0
+    let src one-of turtles with [color = green]
+    let dst one-of turtles with [color = red]
+    repeat num-packets [
+      let path run-one-way algo "S" "D" true false
+      if not empty? path [
+        let who-path map-label-path-to-who path
+        let fit fitness-of-path who-path src dst
+        set total-fitness total-fitness + fit
+        set total-hops total-hops + (length path - 1)
+        let path-energy 0
+        foreach but-first but-last path [ lbl ->
+          let t find-drone-by-label lbl
+          if t != nobody [ set path-energy path-energy + [energy] of t ]
+        ]
+        set total-energy total-energy + path-energy
+        set success-count success-count + 1
+      ]
+      move-drones false
+      update-connections
+    ]
+    ifelse success-count > 0 [
+      output-print (word algo ": успешных доставок " success-count "/" num-packets
+        ", ср. прыжков = " precision (total-hops / success-count) 1
+        ", ср. энергия = " precision (total-energy / success-count) 1
+        ", ср. фитнес = " precision (total-fitness / success-count) 2)
+    ] [
+      output-print (word algo ": нет успешных доставок")
+    ]
+  ]
+end
+
+;; ============================================================
+;; ТЕСТ 3 – СЛОЖНОСТЬ (ВЫЧИСЛИТЕЛЬНАЯ)
+;; Измеряет время выполнения 100 последовательных передач
+;; для каждого алгоритма. Показывает, насколько быстро
+;; алгоритм способен обрабатывать пакеты.
+;; ============================================================
+to test-complexity  
+  let num-packets 100
+  output-print "==================== ТЕСТ СЛОЖНОСТИ ===================="
+  foreach ["GWO" "FSS" "SMO" "DSR"] [ algo ->
+    restore-test-snapshot
+    random-seed 12345
+    set test-mode? true
+    reinit-all-agents algo
+    init-knowledge-base algo
+    let old-silent silent-mode?
+    set silent-mode? true
+    if algo != "DSR" [
+      repeat 10 [ algo-update-both-directions algo tick ]
+    ]
+    set silent-mode? old-silent
+    set test-mode? false
+    set epsilon 0.2
+    reset-timer
+    repeat num-packets [
+      let _ run-one-way algo "S" "D" true false
+      move-drones false
+      update-connections
+    ]
+    let elapsed timer
+    output-print (word algo ": " precision elapsed 2 " сек на " num-packets " пакетов")
+  ]
+end
+
+;; ============================================================
+;; ТЕСТ 4 – УСТОЙЧИВОСТЬ (к случайным отказам)
+;; Моделирует случайные кратковременные отказы дронов
+;; и проверяет, сколько пакетов всё равно доставляется.
+;; Хороший алгоритм должен обходить отказавшие узлы.
+;; ============================================================
+to test-robustness
+  let num-packets 200
+  output-print "==================== ТЕСТ УСТОЙЧИВОСТИ (СЛУЧАЙНЫЕ ОТКАЗЫ) ===================="
+  let failure-prob 0.20
+  let max-fail-duration 15
+  foreach ["GWO" "FSS" "SMO" "DSR"] [ algo ->
+    restore-test-snapshot
+    random-seed 12345
+    set test-mode? true
+    reinit-all-agents algo
+    init-knowledge-base algo
+    let old-silent silent-mode?
+    set silent-mode? true
+    if algo != "DSR" [
+      repeat 10 [ algo-update-both-directions algo tick ]
+    ]
+    set silent-mode? old-silent
+    set test-mode? false
+    set epsilon 0.2
+    ask turtles [ set failure-ticks 0 ]
+    let successes 0
+    let total 0
+    let step 0
+    repeat num-packets [
+      set step step + 1
+      if random-float 1.0 < failure-prob [
+        let victim one-of turtles with [color = blue and failure-ticks = 0 and energy > 0]
+        if victim != nobody [
+          ask victim [
+            set failure-ticks 1 + random max-fail-duration
+            set color black
+          ]
+        ]
+      ]
+      ask turtles with [failure-ticks > 0] [
+        set failure-ticks failure-ticks - 1
+        if failure-ticks = 0 and energy > 0 [ set-color-by-role ]
+      ]
+      let path run-one-way algo "S" "D" true false
+      if not empty? path and last path = "D" [ set successes successes + 1 ]
+      set total total + 1
+      move-drones false
+      update-connections
+    ]
+    ask turtles [ set failure-ticks 0 set-color-by-role ]
+    output-print (word algo ": успешно " successes " из " total
+      " (вероятность отказа " precision failure-prob 2
+      ", макс. длительность " max-fail-duration ")")
+  ]
+end
+
+;; ============================================================
+;; ТЕСТ 5 – АДАПТИВНОСТЬ (равномерность загрузки узлов)
+;; Подсчитывает, насколько равномерно распределяется нагрузка
+;; (количество использований) между синими дронами.
+;; Индекс Джайна = 1 – идеальная равномерность, ~0 – сильная неравномерность.
+;; ============================================================
+to test-adaptability
+  let num-packets 500
+  output-print "==================== ТЕСТ АДАПТИВНОСТИ (РАВНОМЕРНОСТЬ ЗАГРУЗКИ) ===================="
+  foreach ["GWO" "FSS" "SMO" "DSR"] [ algo ->
+    restore-test-snapshot
+    random-seed 12345
+    set test-mode? true
+    reinit-all-agents algo
+    init-knowledge-base algo
+    let old-silent silent-mode?
+    set silent-mode? true
+    if algo != "DSR" [
+      repeat 10 [ algo-update-both-directions algo tick ]
+    ]
+    set silent-mode? old-silent
+    set test-mode? false
+    set epsilon 0.2
+    let usage-list []
+    ask turtles with [color = blue] [
+      set usage-list lput (list label 0) usage-list
+    ]
+    repeat num-packets [
+      let path run-one-way algo "S" "D" true false
+      if not empty? path [
+        foreach but-first but-last path [ lbl ->
+          let new-usage-list []
+          foreach usage-list [ entry ->
+            ifelse item 0 entry = lbl
+              [ set new-usage-list lput (list lbl (item 1 entry + 1)) new-usage-list ]
+              [ set new-usage-list lput entry new-usage-list ]
+          ]
+          set usage-list new-usage-list
+        ]
+      ]
+      move-drones false
+      update-connections
+    ]
+    let counts map [ entry -> item 1 entry ] usage-list
+    let n length counts
+    let sum-counts sum counts
+    let sum-sq sum map [ c -> c * c ] counts
+    let jain 1
+    if n > 0 and sum-sq > 0 [
+      set jain (sum-counts * sum-counts) / (n * sum-sq)
+    ]
+    output-print (word algo ": индекс Джайна = " precision jain 3
+      ", среднее использование = " precision (mean counts) 1)
+  ]
+end
+
+;; ============================================================
+;; ТЕСТ 6 – СПРАВЕДЛИВОСТЬ (обслуживание всех пользователей)
+;; Проверяет равномерность распределения транзитной нагрузки
+;; между синими дронами при случайных парах источник-получатель.
+;; Оптимизирован для слабосвязных сетей: уменьшен лимит шагов,
+;; сокращено начальное обучение, увеличен лимит попыток.
+;; ============================================================
+to test-fairness
+  let num-packets 100            
+  let max-attempts 1000        
+  output-print "==================== ТЕСТ СПРАВЕДЛИВОСТИ (СЛУЧАЙНЫЕ ПАРЫ) ===================="
+  foreach ["GWO" "FSS" "SMO" "DSR"] [ algo ->
+    restore-test-snapshot
+    random-seed 12345
+    set test-mode? true
+    reinit-all-agents algo
+    init-knowledge-base algo
+    let old-silent silent-mode?
+    set silent-mode? true
+    if algo != "DSR" [
+      repeat 10 [ algo-update-both-directions algo tick ]
+    ]
+    set silent-mode? old-silent
+    set test-mode? false
+    set epsilon 0.2
+
+    let usage-list []
+    ask turtles with [color = blue] [
+      set usage-list lput (list label 0) usage-list
+    ]
+    let all-nodes turtles
+    let tries 0
+    let successful-tries 0
+
+    ;; Цикл с ограничением по общему числу попыток
+    while [successful-tries < num-packets and tries < max-attempts] [
+      set tries tries + 1
+      let src nobody
+      let dst nobody
+      while [src = nobody or dst = nobody or src = dst] [
+        set src one-of all-nodes
+        set dst one-of all-nodes
+      ]
+      ;; Передача только если есть путь
+      if is-path-possible? src dst 20 [
+        set successful-tries successful-tries + 1
+        set visited-for-packet []
+        reset-visit-counts
+        ;; run-one-way теперь использует лимит 300 шагов (изменено выше)
+        let path run-one-way algo ([label] of src) ([label] of dst) true false
+        if not empty? path [
+          foreach but-first but-last path [ lbl ->
+            let new-usage-list []
+            foreach usage-list [ entry ->
+              ifelse item 0 entry = lbl
+                [ set new-usage-list lput (list lbl (item 1 entry + 1)) new-usage-list ]
+                [ set new-usage-list lput entry new-usage-list ]
+            ]
+            set usage-list new-usage-list
+          ]
+        ]
+        move-drones false
+        update-connections
+      ]
+    ]
+
+    ;; Расчёт коэффициента Джини
+    let counts map [ entry -> item 1 entry ] usage-list
+    if not empty? counts [
+      let sorted-counts sort counts
+      let n length sorted-counts
+      let sum-counts sum sorted-counts
+      if sum-counts > 0 [
+        let sum-i-weighted 0
+        let i 1
+        while [i <= n] [
+          set sum-i-weighted (sum-i-weighted + i * (item (i - 1) sorted-counts))
+          set i i + 1
+        ]
+        let gini ( (2 * sum-i-weighted) / (n * sum-counts) - (n + 1) / n )
+        output-print (word algo ": коэффициент Джини = " precision gini 3
+          ", среднее использование = " precision (mean counts) 1)
+      ]
+    ]
+  ]
+end
+
+;; ============================================================
+;; Инициализация при запуске модели
+;; ============================================================
+to startup
+  setup-globals
+  create-map
+end]]></code>
+  <widgets>
+    <view x="680" wrappingAllowedX="false" y="145" frameRate="30.0" minPycor="-5" height="885" showTickCounter="true" patchSize="80.1" fontSize="10" wrappingAllowedY="false" width="885" tickCounterLabel="ticks" maxPycor="5" updateMode="0" maxPxcor="5" minPxcor="-5"></view>
+    <slider x="235" step="1" y="80" max="100" width="200" display="drone-speed" height="50" min="0" direction="Horizontal" default="100.0" variable="drone-speed" units="км/ч"></slider>
+    <slider x="445" step="1000" y="80" max="50000" width="200" display="hop-penalty" height="50" min="0" direction="Horizontal" default="5000.0" variable="hop-penalty"></slider>
+    <slider x="445" step="0.1" y="20" max="10" width="200" display="energy-weight" height="50" min="0" direction="Horizontal" default="1.0" variable="energy-weight"></slider>
+    <slider x="235" step="1" y="20" max="10" width="200" display="comm-range-value" height="50" min="0" direction="Horizontal" default="5.0" variable="comm-range-value" units="км"></slider>
+    <slider x="25" step="1" y="140" max="3600" width="200" display="dest-energy" height="50" min="0" direction="Horizontal" default="3021.0" variable="dest-energy" units="секунд"></slider>
+    <slider x="25" step="1" y="20" max="3600" width="200" display="ordinary-energy" height="50" min="0" direction="Horizontal" default="2979.0" variable="ordinary-energy" units="секунд"></slider>
+    <slider x="25" step="1" y="80" max="3600" width="200" display="start-energy" height="50" min="0" direction="Horizontal" default="2917.0" variable="start-energy" units="секунд"></slider>
+    <switch x="25" y="250" height="40" on="true" variable="random-range?" width="125" display="random-range?"></switch>
+    <switch x="160" y="250" height="40" on="true" variable="dead-drone-off?" width="125" display="dead-drone-off?"></switch>
+    <switch x="160" y="200" height="40" on="true" variable="random-energy?" width="125" display="random-energy?"></switch>
+    <switch x="25" y="200" height="40" on="true" variable="random-speed?" width="125" display="random-speed?"></switch>
+    <button x="775" y="70" height="65" disableUntilTicks="false" forever="false" kind="Observer" width="140" display="Сделать 1 шаг">move-drones true</button>
+    <switch x="290" y="200" height="40" on="false" variable="dynamic-failures?" width="125" display="dynamic-failures?"></switch>
+    <button x="1320" y="70" height="65" disableUntilTicks="false" forever="true" kind="Observer" width="145" display="Запуск цикла шагов">move-drones true</button>
+    <button x="965" y="65" height="70" disableUntilTicks="false" forever="false" kind="Observer" width="315" display="Создать случайную карту">create-map</button>
+    <button x="1775" y="80" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="185" display="Отправка 100 пакетов DSR">run-dsr-loop-distributed</button>
+    <button x="1775" y="30" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="185" display="Отправка 1 пакета DSR">run-dsr-distributed</button>
+    <button x="1780" y="250" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="185" display="Отправка 100 пакетов FSS">run-fss-loop-distributed</button>
+    <slider x="1780" step="1" y="300" max="10" width="185" display="fss-pop-size" height="50" min="1" direction="Horizontal" default="3.0" variable="fss-pop-size" units="рыб"></slider>
+    <slider x="1780" step="1" y="420" max="30" width="185" display="fss-max-iter" height="50" min="1" direction="Horizontal" default="10.0" variable="fss-max-iter"></slider>
+    <slider x="1780" step="0.01" y="480" max="0.5" width="185" display="fss-step-vol-init" height="50" min="0.01" direction="Horizontal" default="0.5" variable="fss-step-vol-init"></slider>
+    <slider x="1780" step="0.1" y="360" max="1" width="185" display="fss-step-ind-init" height="50" min="0.1" direction="Horizontal" default="0.5" variable="fss-step-ind-init"></slider>
+    <button x="1780" y="200" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="185" display="Отправка 1 пакета FSS">run-fss-distributed</button>
+    <button x="1975" y="250" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="185" display="Отправка 100 пакетов SMO">run-smo-loop-distributed</button>
+    <slider x="1975" step="1" y="300" max="30" width="185" display="smo-pop-size" height="50" min="1" direction="Horizontal" default="3.0" variable="smo-pop-size" units="обезьян"></slider>
+    <slider x="1975" step="1" y="420" max="100" width="185" display="smo-global-leader-limit" height="50" min="1" direction="Horizontal" default="10.0" variable="smo-global-leader-limit" units="итер"></slider>
+    <slider x="1975" step="0.1" y="480" max="1" width="185" display="smo-perturbation-rate" height="50" min="0" direction="Horizontal" default="0.5" variable="smo-perturbation-rate" units="возмущения"></slider>
+    <button x="1975" y="200" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="185" display="Отправка 1 пакета SMO">run-smo-distributed</button>
+    <slider x="1975" step="1" y="360" max="100" width="185" display="smo-local-leader-limit" height="50" min="1" direction="Horizontal" default="5.0" variable="smo-local-leader-limit" units="итер"></slider>
+    <slider x="1585" step="1" y="300" max="20" width="185" display="gwo-pop-size" height="50" min="3" direction="Horizontal" default="5.0" variable="gwo-pop-size" units="волков"></slider>
+    <button x="1585" y="250" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="186" display="Отправка 100 пакетов по GWO">run-gwo-loop-distributed</button>
+    <button x="1585" y="200" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="185" display="Отправка 1 пакета по GWO">run-gwo-distributed</button>
+    <note x="1585" y="150" backgroundDark="0" fontSize="14" width="580" markdown="false" height="41" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">===================== Роевые алгоритмы ======================</note>
+    <button x="555" y="240" height="50" disableUntilTicks="false" forever="false" kind="Observer" width="120" display="Создание дронов">create-ordinary-drones</button>
+    <button x="425" y="180" height="50" disableUntilTicks="false" forever="false" kind="Observer" width="120" display="Начальный дрон">set-start-drone</button>
+    <button x="555" y="180" height="50" disableUntilTicks="false" forever="false" kind="Observer" width="120" display="Поменять местами">swap-drones</button>
+    <button x="425" y="240" height="50" disableUntilTicks="false" forever="false" kind="Observer" width="120" display="Конечный дрон">set-dest-drone</button>
+    <output x="35" y="295" height="735" fontSize="12" width="640"></output>
+    <slider x="1585" step="1" y="360" max="20" width="185" display="gwo-max-iter" height="50" min="1" direction="Horizontal" default="20.0" variable="gwo-max-iter"></slider>
+    <slider x="1585" step="0.01" y="420" max="1" width="185" display="mutation-rate" height="50" min="0" direction="Horizontal" default="0.1" variable="mutation-rate"></slider>
+    <slider x="1585" step="0.1" y="480" max="1" width="185" display="levy-rate" height="50" min="0" direction="Horizontal" default="0.5" variable="levy-rate"></slider>
+    <note x="1575" y="580" backgroundDark="0" fontSize="14" width="585" markdown="false" height="40" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">==================== Тестирование алгоритмов ===================</note>
+    <button x="1775" y="630" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="185" display="Тест FSS">run-fss-parameter-sweep</button>
+    <button x="1775" y="810" height="50" disableUntilTicks="false" forever="false" kind="Observer" width="185" display="Сохранить топологию">capture-test-snapshot</button>
+    <button x="1970" y="745" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="185" display="Тест справедливости">test-fairness</button>
+    <button x="1775" y="745" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="185" display="Тест адаптивности">test-adaptability</button>
+    <button x="1580" y="745" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="185" display="Тест устойчивости">test-robustness</button>
+    <button x="1970" y="630" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="185" display="Тест SMO">run-smo-parameter-sweep</button>
+    <button x="1580" y="695" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="185" display="Тест корректности">test-correctness</button>
+    <button x="1970" y="695" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="185" display="Тест сложности">test-complexity</button>
+    <button x="1775" y="695" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="185" display="Тест эффективности">test-efficiency</button>
+    <button x="1580" y="630" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="185" display="Тест GWO">run-gwo-parameter-sweep</button>
+  </widgets>
+  <info>## WHAT IS IT?
+
+(a general understanding of what the model is trying to show or explain)
+
+## HOW IT WORKS
+
+(what rules the agents use to create the overall behavior of the model)
+
+## HOW TO USE IT
+
+(how to use the model, including a description of each of the items in the Interface tab)
+
+## THINGS TO NOTICE
+
+(suggested things for the user to notice while running the model)
+
+## THINGS TO TRY
+
+(suggested things for the user to try to do (move sliders, switches, etc.) with the model)
+
+## EXTENDING THE MODEL
+
+(suggested things to add or change in the Code tab to make the model more complicated, detailed, accurate, etc.)
+
+## NETLOGO FEATURES
+
+(interesting or unusual features of NetLogo that the model uses, particularly in the Code tab; or where workarounds were needed for missing features)
+
+## RELATED MODELS
+
+(models in the NetLogo Models Library and elsewhere which are of related interest)
+
+## CREDITS AND REFERENCES
+
+(a reference to the model's URL on the web if it has one, as well as any other necessary credits, citations, and links)
+</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+</model>
